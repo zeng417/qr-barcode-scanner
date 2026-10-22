@@ -33,10 +33,10 @@ class DetectedCode:
 class CodeDetector:
     """组合 OpenCV 二维码检测与 pyzbar 一维条码检测。"""
 
-    def __init__(self, enhance_every: int = 3) -> None:
+    def __init__(self, retry_every: int = 3) -> None:
         self._qr = cv2.QRCodeDetector()
-        # 原图识别失败后，每隔 enhance_every 帧做一次增强图像重试，避免逐帧多次解码拖慢实时性
-        self._enhance_every = max(1, enhance_every)
+        # 常规解码失败后，每隔 retry_every 帧才跑一次兜底策略，避免拖慢实时画面
+        self._retry_every = max(1, retry_every)
         self._failed_frames = 0
 
     @property
@@ -100,9 +100,41 @@ class CodeDetector:
 
         scale = 2.0
         enlarged = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-        data, pts, _ = self._qr.detectAndDecode(enlarged)
+        # 补白边，避免裁剪切掉二维码必需的静区
+        pad2 = max(8, int(0.1 * max(enlarged.shape[:2])))
+        padded = cv2.copyMakeBorder(
+            enlarged, pad2, pad2, pad2, pad2, cv2.BORDER_CONSTANT, value=255
+        )
+        data, pts, _ = self._qr.detectAndDecode(padded)
         if data and pts is not None:
-            pts = pts.reshape(-1, 2) / scale + np.array([x0, y0])
+            pts = (pts.reshape(-1, 2) - pad2) / scale + np.array([x0, y0])
+        return data, pts
+
+    def _decode_qr_contour(self, frame: np.ndarray) -> tuple[str, Optional[np.ndarray]]:
+        """针对深色背景/缺少静区：按亮色像素范围定位码，裁剪后补白边再解码。"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        ys, xs = np.where(binary > 0)
+        if xs.size == 0:
+            return "", None
+
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        w, h = x1 - x0, y1 - y0
+        if w < 20 or h < 20:
+            return "", None
+        # 只处理接近正方形、且没有铺满整幅画面的亮区，避免把整张背景当成码
+        if max(w, h) / max(1, min(w, h)) > 3:
+            return "", None
+        if w > 0.95 * gray.shape[1] and h > 0.95 * gray.shape[0]:
+            return "", None
+
+        crop = gray[y0:y1, x0:x1]
+        pad = max(8, int(0.15 * max(crop.shape[:2])))
+        padded = cv2.copyMakeBorder(crop, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
+        data, pts, _ = self._qr.detectAndDecode(padded)
+        if data and pts is not None:
+            pts = pts.reshape(-1, 2) - pad + np.array([x0, y0])
         return data, pts
 
     def _detect_qr(self, frame: np.ndarray) -> list[DetectedCode]:
@@ -112,24 +144,28 @@ class CodeDetector:
             self._failed_frames = 0
             return [self._make_qr(data, points)]
 
-        # 常规检测失败：定位码区域后裁剪放大再解码（小码/远距离）
-        data, points = self._decode_qr_roi(frame)
-        if data:
-            self._failed_frames = 0
-            return [self._make_qr(data, points)]
-
-        # 仍失败：尝试曲面/畸变解码
-        data, points = self._decode_qr_curved(frame)
-        if data:
-            self._failed_frames = 0
-            return [self._make_qr(data, points)]
-
-        # 仍然失败：按间隔尝试增强图像（二值化 / 反色 / 自适应阈值 / 锐化放大）
+        # 常规解码失败：每隔 retry_every 帧才执行一次较重的兜底策略
         self._failed_frames += 1
-        if self._failed_frames < self._enhance_every:
+        if self._failed_frames < self._retry_every:
             return []
         self._failed_frames = 0
 
+        # 小码/远距离：先定位码区域，裁剪放大后解码
+        data, points = self._decode_qr_roi(frame)
+        if data:
+            return [self._make_qr(data, points)]
+
+        # 深色背景/缺少静区：按亮色区域定位并补白边
+        data, points = self._decode_qr_contour(frame)
+        if data:
+            return [self._make_qr(data, points)]
+
+        # 曲面/畸变码
+        data, points = self._decode_qr_curved(frame)
+        if data:
+            return [self._make_qr(data, points)]
+
+        # 最后尝试二值化 / 反色 / 自适应阈值 / 锐化放大等增强图像
         for variant, scale in self._enhance_variants(frame):
             data, points = self._decode_qr(variant)
             if data:
@@ -145,11 +181,17 @@ class CodeDetector:
             gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5
         )
 
-        variants: list[tuple[np.ndarray, float]] = [
+        variants: list[tuple[np.ndarray, float]] = []
+        # 补白边：很多二维码（截图、贴边、深色背景）缺少静区导致无法定位
+        pad = max(8, int(0.08 * max(gray.shape[:2])))
+        variants.append(
+            (cv2.copyMakeBorder(gray, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255), 1.0)
+        )
+        variants.extend([
             (otsu, 1.0),                    # 光照不均、整体偏暗
             (cv2.bitwise_not(gray), 1.0),   # 深底浅色的反色码
             (adaptive, 1.0),                # 局部过曝/阴影
-        ]
+        ])
 
         # 锐化提升模糊码边缘；窄画面再放大 2 倍，帮助识别远距离小码
         sharp = cv2.addWeighted(
