@@ -16,7 +16,9 @@ import cv2
 
 from .config import (
     AUTO_OPEN_URL,
+    CAMERA_HEIGHT,
     CAMERA_INDEX,
+    CAMERA_WIDTH,
     CSV_HEADER,
     DETECT_EVERY_N_FRAMES,
     RECORD_CSV,
@@ -67,6 +69,10 @@ def main() -> int:
     if not cap.isOpened():
         print(f"[错误] 无法打开摄像头 {CAMERA_INDEX}")
         return 1
+
+    # 尽量使用高分辨率采集，提升小码/远距离的识别率
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
 
     print("按 Q / Esc 退出。")
 
