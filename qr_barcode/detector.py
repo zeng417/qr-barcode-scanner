@@ -61,15 +61,70 @@ class CodeDetector:
             return "", None
         return data, points
 
+    def _decode_qr_curved(self, image: np.ndarray) -> tuple[str, Optional[np.ndarray]]:
+        """处理曲面/透视畸变的二维码（部分 OpenCV 版本不支持则跳过）。"""
+        if not hasattr(self._qr, "detectAndDecodeCurved"):
+            return "", None
+        try:
+            data, points, _ = self._qr.detectAndDecodeCurved(image)
+        except cv2.error:
+            return "", None
+        return data, points
+
+    @staticmethod
+    def _make_qr(data: str, points: Optional[np.ndarray], scale: float = 1.0) -> DetectedCode:
+        """构造二维码结果，并把增强图像的坐标换算回原图。"""
+        pts = None
+        if points is not None:
+            pts = (points.reshape(-1, 2) / scale).astype(int)
+        return DetectedCode(kind="QR", points=pts, data=data)
+
+    def _decode_qr_roi(self, frame: np.ndarray) -> tuple[str, Optional[np.ndarray]]:
+        """先定位二维码区域，裁剪放大后再解码，适合画面中较小的码。"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+        try:
+            ok, points = self._qr.detect(gray)
+        except cv2.error:
+            return "", None
+        if not ok or points is None:
+            return "", None
+
+        x, y, w, h = cv2.boundingRect(points.astype(np.int32))
+        pad = max(10, int(0.3 * max(w, h)))
+        x0, y0 = max(0, x - pad), max(0, y - pad)
+        x1 = min(gray.shape[1], x + w + pad)
+        y1 = min(gray.shape[0], y + h + pad)
+        crop = gray[y0:y1, x0:x1]
+        if crop.size == 0:
+            return "", None
+
+        scale = 2.0
+        enlarged = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        data, pts, _ = self._qr.detectAndDecode(enlarged)
+        if data and pts is not None:
+            pts = pts.reshape(-1, 2) / scale + np.array([x0, y0])
+        return data, pts
+
     def _detect_qr(self, frame: np.ndarray) -> list[DetectedCode]:
         """OpenCV QRCodeDetector：返回带多边形包围框的二维码。"""
         data, points = self._decode_qr(frame)
         if data:
             self._failed_frames = 0
-            pts = points.reshape(-1, 2).astype(int) if points is not None else None
-            return [DetectedCode(kind="QR", points=pts, data=data)]
+            return [self._make_qr(data, points)]
 
-        # 原图失败：按间隔尝试增强图像（二值化 / 反色 / 闭运算 / 对比度增强）
+        # 常规检测失败：定位码区域后裁剪放大再解码（小码/远距离）
+        data, points = self._decode_qr_roi(frame)
+        if data:
+            self._failed_frames = 0
+            return [self._make_qr(data, points)]
+
+        # 仍失败：尝试曲面/畸变解码
+        data, points = self._decode_qr_curved(frame)
+        if data:
+            self._failed_frames = 0
+            return [self._make_qr(data, points)]
+
+        # 仍然失败：按间隔尝试增强图像（二值化 / 反色 / 自适应阈值 / 锐化放大）
         self._failed_frames += 1
         if self._failed_frames < self._enhance_every:
             return []
@@ -78,10 +133,7 @@ class CodeDetector:
         for variant, scale in self._enhance_variants(frame):
             data, points = self._decode_qr(variant)
             if data:
-                pts = None
-                if points is not None:
-                    pts = (points.reshape(-1, 2) / scale).astype(int)
-                return [DetectedCode(kind="QR", points=pts, data=data)]
+                return [self._make_qr(data, points, scale)]
         return []
 
     def _enhance_variants(self, frame: np.ndarray) -> list[tuple[np.ndarray, float]]:
@@ -94,18 +146,20 @@ class CodeDetector:
         )
 
         variants: list[tuple[np.ndarray, float]] = [
-            (otsu, 1.0),             # 光照不均、整体偏暗
-            (cv2.bitwise_not(otsu), 1.0),  # 深底浅色的反色码
-            (adaptive, 1.0),         # 局部过曝/阴影
+            (otsu, 1.0),                    # 光照不均、整体偏暗
+            (cv2.bitwise_not(gray), 1.0),   # 深底浅色的反色码
+            (adaptive, 1.0),                # 局部过曝/阴影
         ]
 
-        # 距离较远的小码：锐化后放大 2 倍再解码
-        if gray.shape[1] <= 1280:
-            sharp = cv2.addWeighted(
-                gray, 2.0, cv2.GaussianBlur(gray, (0, 0), 3), -1.0, 0
+        # 锐化提升模糊码边缘；窄画面再放大 2 倍，帮助识别远距离小码
+        sharp = cv2.addWeighted(
+            gray, 2.0, cv2.GaussianBlur(gray, (0, 0), 3), -1.0, 0
+        )
+        variants.append((sharp, 1.0))
+        if gray.shape[1] < 960:
+            variants.append(
+                (cv2.resize(sharp, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC), 2.0)
             )
-            sharp = cv2.resize(sharp, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-            variants.append((sharp, 2.0))
         return variants
 
     def _detect_barcode(self, gray: np.ndarray) -> list[DetectedCode]:
