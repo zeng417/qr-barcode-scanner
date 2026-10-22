@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 import webbrowser
 
 import cv2
@@ -73,8 +75,10 @@ def main() -> int:
     # 尽量使用高分辨率采集，提升小码/远距离的识别率
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+    print(f"[信息] 采集分辨率: "
+          f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
 
-    print("按 Q / Esc 退出。")
+    print("按 Q / Esc 退出，按 S 保存当前画面用于排查。")
 
     codes: list[DetectedCode] = []
     active: set[tuple[str, str]] = set()  # 当前画面中的码，用于去重
@@ -111,6 +115,12 @@ def main() -> int:
 
             cv2.imshow("QR / Barcode Scanner", frame)
             key = cv2.waitKey(1) & 0xFF
+            if key == ord("s"):
+                out_dir = os.path.dirname(RECORD_CSV) or "."
+                os.makedirs(out_dir, exist_ok=True)
+                path = os.path.join(out_dir, f"frame_{int(time.time())}.png")
+                cv2.imwrite(path, frame)
+                print(f"[调试] 已保存当前画面: {path}")
             if key in (ord("q"), 27):  # q 或 Esc
                 break
     finally:
