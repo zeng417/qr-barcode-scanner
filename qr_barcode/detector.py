@@ -111,31 +111,37 @@ class CodeDetector:
         return data, pts
 
     def _decode_qr_contour(self, frame: np.ndarray) -> tuple[str, Optional[np.ndarray]]:
-        """针对深色背景/缺少静区：按亮色像素范围定位码，裁剪后补白边再解码。"""
+        """针对深色背景/缺少静区：按亮色区域逐个定位候选码，补白边后解码。"""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        ys, xs = np.where(binary > 0)
-        if xs.size == 0:
-            return "", None
 
-        x0, x1 = int(xs.min()), int(xs.max()) + 1
-        y0, y1 = int(ys.min()), int(ys.max()) + 1
-        w, h = x1 - x0, y1 - y0
-        if w < 20 or h < 20:
-            return "", None
-        # 只处理接近正方形、且没有铺满整幅画面的亮区，避免把整张背景当成码
-        if max(w, h) / max(1, min(w, h)) > 3:
-            return "", None
-        if w > 0.95 * gray.shape[1] and h > 0.95 * gray.shape[0]:
-            return "", None
+        # 用较大的闭运算核把码内部的白色模块连成一块，同时排除整幅背景
+        k = max(5, int(min(gray.shape[:2]) * 0.02)) | 1
+        merged = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+        contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        crop = gray[y0:y1, x0:x1]
-        pad = max(8, int(0.15 * max(crop.shape[:2])))
-        padded = cv2.copyMakeBorder(crop, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
-        data, pts, _ = self._qr.detectAndDecode(padded)
-        if data and pts is not None:
-            pts = pts.reshape(-1, 2) - pad + np.array([x0, y0])
-        return data, pts
+        h_img, w_img = gray.shape[:2]
+        candidates = []
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            if w < 20 or h < 20:
+                continue
+            if not 0.6 <= w / h <= 1.7:  # 二维码接近正方形
+                continue
+            if w * h < 0.002 * w_img * h_img:  # 区域太小不可能是码
+                continue
+            candidates.append((w * h, x, y, w, h))
+
+        for _, x, y, w, h in sorted(candidates, reverse=True)[:3]:
+            crop = gray[y:y + h, x:x + w]
+            pad = max(8, int(0.15 * max(w, h)))
+            padded = cv2.copyMakeBorder(crop, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
+            data, pts, _ = self._qr.detectAndDecode(padded)
+            if data:
+                if pts is not None:
+                    pts = pts.reshape(-1, 2) - pad + np.array([x, y])
+                return data, pts
+        return "", None
 
     def _detect_qr(self, frame: np.ndarray) -> list[DetectedCode]:
         """OpenCV QRCodeDetector：返回带多边形包围框的二维码。"""
