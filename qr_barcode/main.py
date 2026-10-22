@@ -33,6 +33,8 @@ BOX_COLORS = {
     "BARCODE": (255, 200, 0), # 蓝色
 }
 
+WINDOW_NAME = "QR / Barcode Scanner"
+
 
 def draw_code(frame, code: DetectedCode) -> None:
     """在画面上绘制包围框与解码文本。"""
@@ -79,6 +81,8 @@ def main() -> int:
           f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
 
     print("按 Q / Esc 退出，按 S 保存当前画面用于排查。")
+    # 使用精简窗口，隐藏 OpenCV 自带的缩放/保存等工具栏按钮
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_GUI_NORMAL)
 
     codes: list[DetectedCode] = []
     active: set[tuple[str, str]] = set()  # 当前画面中的码，用于去重
@@ -113,7 +117,7 @@ def main() -> int:
             for code in codes:
                 draw_code(frame, code)
 
-            cv2.imshow("QR / Barcode Scanner", frame)
+            cv2.imshow(WINDOW_NAME, frame)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("s"):
                 out_dir = os.path.dirname(RECORD_CSV) or "."
