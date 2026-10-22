@@ -14,7 +14,13 @@ import webbrowser
 
 import cv2
 
-from .config import AUTO_OPEN_URL, CAMERA_INDEX, CSV_HEADER, RECORD_CSV
+from .config import (
+    AUTO_OPEN_URL,
+    CAMERA_INDEX,
+    CSV_HEADER,
+    DETECT_EVERY_N_FRAMES,
+    RECORD_CSV,
+)
 from .detector import CodeDetector, DetectedCode
 from .recorder import CsvRecorder
 
@@ -64,6 +70,10 @@ def main() -> int:
 
     print("按 Q / Esc 退出。")
 
+    codes: list[DetectedCode] = []
+    active: set[tuple[str, str]] = set()  # 当前画面中的码，用于去重
+    detect_cooldown = 0
+
     try:
         while True:
             ok, frame = cap.read()
@@ -71,12 +81,27 @@ def main() -> int:
                 print("[错误] 读取摄像头画面失败")
                 break
 
-            for code in detector.detect(frame):
+            # 无码时才按 DETECT_EVERY_N_FRAMES 间隔重试，避免空转消耗 CPU
+            if detect_cooldown > 0:
+                detect_cooldown -= 1
+            else:
+                codes = detector.detect(frame)
+                if not codes and DETECT_EVERY_N_FRAMES > 1:
+                    detect_cooldown = DETECT_EVERY_N_FRAMES - 1
+
+                current = {(code.kind, code.data) for code in codes}
+                for code in codes:
+                    # 同一码持续出现在画面中时只记录一次
+                    if (code.kind, code.data) in active:
+                        continue
+                    print(f"[{code.kind}] {code.data}")
+                    recorder.add(code.kind, code.data)
+                    if code.data not in opened_links and maybe_open_url(code.data):
+                        opened_links.add(code.data)
+                active = current
+
+            for code in codes:
                 draw_code(frame, code)
-                print(f"[{code.kind}] {code.data}")
-                recorder.add(code.kind, code.data)
-                if maybe_open_url(code.data):
-                    opened_links.add(code.data)
 
             cv2.imshow("QR / Barcode Scanner", frame)
             key = cv2.waitKey(1) & 0xFF
