@@ -41,7 +41,7 @@ python -m qr_barcode.main
 
 - 对准二维码 / 条形码，识别结果实时显示在画面左上角并打印到终端
 - 每帧识别到的码会自动追加到 `records/history.csv`
-- 按 `Q` 或 `Esc` 退出
+- 按 `Q` 或 `Esc` 退出；按 `S` 保存当前画面到 `records/`，用于排查识别失败
 
 ## 配置
 
