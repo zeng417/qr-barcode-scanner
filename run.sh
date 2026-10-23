@@ -15,7 +15,7 @@ if [ ! -x "$PY" ]; then
     fi
 fi
 
-if ! "$PY" -c "import cv2, numpy" >/dev/null 2>&1; then
+if ! "$PY" -c "import cv2, numpy, zxingcpp" >/dev/null 2>&1; then
     echo "[2/2] 安装依赖..."
     "$PY" -m pip install -r requirements.txt
 fi
