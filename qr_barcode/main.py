@@ -25,9 +25,18 @@ from .config import (
     CAMERA_WIDTH,
     CSV_HEADER,
     DETECT_EVERY_N_FRAMES,
+    MQTT_BROKER,
+    MQTT_CLIENT_ID,
+    MQTT_ENABLED,
+    MQTT_PASSWORD,
+    MQTT_PORT,
+    MQTT_QOS,
+    MQTT_TOPIC,
+    MQTT_USERNAME,
     RECORD_CSV,
 )
 from .detector import CodeDetector, DetectedCode
+from .publisher import MqttPublisher
 from .recorder import CsvRecorder
 
 BOX_COLORS = {
@@ -98,9 +107,31 @@ def maybe_open_url(data: str) -> bool:
     return False
 
 
+def create_publisher() -> MqttPublisher | None:
+    """按配置创建 MQTT 发布器；未启用或缺依赖时返回 None。"""
+    if not MQTT_ENABLED:
+        return None
+    publisher = MqttPublisher(
+        MQTT_BROKER,
+        MQTT_PORT,
+        MQTT_TOPIC,
+        client_id=MQTT_CLIENT_ID,
+        username=MQTT_USERNAME,
+        password=MQTT_PASSWORD,
+        qos=MQTT_QOS,
+    )
+    if not publisher.available:
+        print("[提示] MQTT 已启用但未安装 paho-mqtt，推送已关闭。"
+              "可执行: pip install paho-mqtt")
+        return None
+    print(f"[信息] MQTT 推送: {MQTT_TOPIC} @ {MQTT_BROKER}:{MQTT_PORT}")
+    return publisher
+
+
 def main() -> int:
     detector = CodeDetector()
     recorder = CsvRecorder(RECORD_CSV, CSV_HEADER)
+    publisher = create_publisher()
     opened_links: set[str] = set()
 
     print(f"[信息] 解码引擎: {' + '.join(detector.engines)}")
@@ -111,6 +142,8 @@ def main() -> int:
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
         print(f"[错误] 无法打开摄像头 {CAMERA_INDEX}")
+        if publisher is not None:
+            publisher.close()
         return 1
 
     # 尽量使用高分辨率采集，提升小码/远距离的识别率
@@ -161,6 +194,8 @@ def main() -> int:
                         continue
                     print(f"[{code.kind}] {code.data}")
                     recorder.add(code.kind, code.data)
+                    if publisher is not None:
+                        publisher.publish(code.kind, code.data)
                     if code.data not in opened_links and maybe_open_url(code.data):
                         opened_links.add(code.data)
                 active = current
@@ -179,6 +214,8 @@ def main() -> int:
             if key in (ord("q"), 27):  # q 或 Esc
                 break
     finally:
+        if publisher is not None:
+            publisher.close()
         cap.release()
         cv2.destroyAllWindows()
 
