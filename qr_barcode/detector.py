@@ -1,4 +1,4 @@
-"""检测模块：使用 OpenCV QRCodeDetector 识别二维码，pyzbar 识别一维条码。
+"""检测模块：zxing-cpp 为主，pyzbar、OpenCV QRCodeDetector 补充。
 
 每个检测结果是一个 DetectedCode 对象：
 - kind: "QR" 或 "BARCODE"
@@ -14,52 +14,158 @@ from typing import Optional
 import cv2
 import numpy as np
 
-# pyzbar 为可选依赖，缺少时仅保留二维码识别能力
+# 解码库均为可选依赖，缺少时自动降级
+try:
+    import zxingcpp
+    _HAS_ZXING = True
+except Exception:  # pragma: no cover - 环境无关
+    zxingcpp = None
+    _HAS_ZXING = False
+
 try:
     from pyzbar import pyzbar
     _HAS_PYZBAR = True
 except Exception:  # pragma: no cover - 环境无关
+    pyzbar = None
     _HAS_PYZBAR = False
 
 
 @dataclass
 class DetectedCode:
     kind: str  # "QR" | "BARCODE"
-    points: np.ndarray  # Nx2 的四边形顶点坐标
+    points: Optional[np.ndarray]  # Nx2 的四边形顶点坐标
     data: str
     rect: Optional[tuple] = None  # 条码的近似矩形 (x, y, w, h)
 
 
 class CodeDetector:
-    """组合 OpenCV 二维码检测与 pyzbar 一维条码检测。"""
+    """多引擎组合的二维码/条码检测器。
 
-    def __init__(self, retry_every: int = 3) -> None:
+    识别顺序：zxing-cpp -> pyzbar -> OpenCV，均失败后再做放大/二值化兜底。
+    """
+
+    def __init__(self, retry_every: int = 5) -> None:
         self._qr = cv2.QRCodeDetector()
-        # 常规解码失败后，每隔 retry_every 帧才跑一次兜底策略，避免拖慢实时画面
+        # 没识别到码时，每隔 retry_every 帧才跑一次较重的兜底，避免拖慢实时画面
         self._retry_every = max(1, retry_every)
         self._failed_frames = 0
 
     @property
     def barcode_supported(self) -> bool:
-        return _HAS_PYZBAR
+        return _HAS_PYZBAR or _HAS_ZXING
+
+    @property
+    def engines(self) -> list[str]:
+        """当前可用的解码引擎名称。"""
+        names = []
+        if _HAS_ZXING:
+            names.append("zxing-cpp")
+        if _HAS_PYZBAR:
+            names.append("pyzbar")
+        names.append("OpenCV")
+        return names
 
     def detect(self, frame: np.ndarray) -> list[DetectedCode]:
         """对单帧图像执行识别，返回命中的码列表。"""
-        results: list[DetectedCode] = []
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
 
-        results.extend(self._detect_qr(frame))
-        if _HAS_PYZBAR:
-            results.extend(self._detect_barcode(gray))
+        # zxing-cpp 对实拍码（透视、模糊、屏幕摩尔纹、反色）识别率最高且耗时最低
+        results = self._decode_zxing(gray)
+        if not results and _HAS_PYZBAR:
+            results = self._decode_zbar(gray)
+        if any(code.kind == "QR" for code in results):
+            self._failed_frames = 0
+            return results
+
+        # 未识别到二维码时才执行较重的兜底策略
+        self._failed_frames += 1
+        if self._failed_frames >= self._retry_every:
+            self._failed_frames = 0
+            results.extend(self._detect_qr_fallback(gray))
         return results
 
-    def _decode_qr(self, image: np.ndarray) -> tuple[str, Optional[np.ndarray]]:
-        """对单张图像解码二维码，失败返回 ("", None)。"""
+    def _decode_zxing(self, image: np.ndarray, scale: float = 1.0) -> list[DetectedCode]:
+        """用 zxing-cpp 解码二维码/一维条码，结果坐标换算回原图。"""
+        if not _HAS_ZXING:
+            return []
         try:
-            data, points, _ = self._qr.detectAndDecode(image)
-        except cv2.error:  # 某些 OpenCV 版本对空角点会抛异常
-            return "", None
-        return data, points
+            found = zxingcpp.read_barcodes(image)
+        except Exception:  # 解码库对异常图像可能直接报错
+            return []
+
+        out: list[DetectedCode] = []
+        for result in found:
+            if not result.valid or not result.text:
+                continue
+            pos = result.position
+            points = np.array(
+                [
+                    [pos.top_left.x, pos.top_left.y],
+                    [pos.top_right.x, pos.top_right.y],
+                    [pos.bottom_right.x, pos.bottom_right.y],
+                    [pos.bottom_left.x, pos.bottom_left.y],
+                ],
+                dtype=np.float32,
+            )
+            kind = "QR" if "QR" in result.format.name else "BARCODE"
+            out.append(
+                DetectedCode(
+                    kind=kind,
+                    points=(points / scale).astype(int),
+                    data=result.text,
+                )
+            )
+        return out
+
+    def _decode_zbar(self, image: np.ndarray, scale: float = 1.0) -> list[DetectedCode]:
+        """用 zbar 解码二维码/一维条码，结果坐标换算回原图。"""
+        if not _HAS_PYZBAR:
+            return []
+        try:
+            found = pyzbar.decode(image)
+        except Exception:  # zbar 对异常图像可能直接报错
+            return []
+
+        out: list[DetectedCode] = []
+        for obj in found:
+            data = obj.data.decode("utf-8", errors="replace")
+            if not data:
+                continue
+            if obj.type == "QRCODE" and obj.polygon:
+                points = np.array(
+                    [[p.x, p.y] for p in obj.polygon], dtype=np.float32
+                )
+                out.append(
+                    DetectedCode(kind="QR", points=(points / scale).astype(int), data=data)
+                )
+                continue
+
+            x, y, w, h = obj.rect
+            points = np.array(
+                [[x, y], [x + w, y], [x + w, y + h], [x, y + h]], dtype=np.float32
+            )
+            # 少数情况下二维码没有 polygon，此时用外接矩形标记为二维码
+            kind = "QR" if obj.type == "QRCODE" else "BARCODE"
+            out.append(
+                DetectedCode(
+                    kind=kind,
+                    points=(points / scale).astype(int),
+                    data=data,
+                    rect=(
+                        int(x / scale),
+                        int(y / scale),
+                        int(w / scale),
+                        int(h / scale),
+                    ),
+                )
+            )
+        return out
+
+    @staticmethod
+    def _make_qr(data: str, points: Optional[np.ndarray]) -> DetectedCode:
+        """构造二维码结果。"""
+        pts = None if points is None else points.reshape(-1, 2).astype(int)
+        return DetectedCode(kind="QR", points=pts, data=data)
 
     def _decode_qr_curved(self, image: np.ndarray) -> tuple[str, Optional[np.ndarray]]:
         """处理曲面/透视畸变的二维码（部分 OpenCV 版本不支持则跳过）。"""
@@ -71,151 +177,39 @@ class CodeDetector:
             return "", None
         return data, points
 
-    @staticmethod
-    def _make_qr(data: str, points: Optional[np.ndarray], scale: float = 1.0) -> DetectedCode:
-        """构造二维码结果，并把增强图像的坐标换算回原图。"""
-        pts = None
-        if points is not None:
-            pts = (points.reshape(-1, 2) / scale).astype(int)
-        return DetectedCode(kind="QR", points=pts, data=data)
+    def _detect_qr_fallback(self, gray: np.ndarray) -> list[DetectedCode]:
+        """放大 + 锐化 / 二值化后再次解码，适合画面中较小、较模糊的码。"""
+        big = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+        sharp = cv2.addWeighted(big, 2.0, cv2.GaussianBlur(big, (0, 0), 2), -1.0, 0)
+        _, otsu = cv2.threshold(big, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants = (sharp, otsu)
 
-    def _decode_qr_roi(self, frame: np.ndarray) -> tuple[str, Optional[np.ndarray]]:
-        """先定位二维码区域，裁剪放大后再解码，适合画面中较小的码。"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
-        try:
-            ok, points = self._qr.detect(gray)
-        except cv2.error:
-            return "", None
-        if not ok or points is None:
-            return "", None
+        # zxing-cpp 最强，逐一变体尝试
+        for variant in variants:
+            found = [
+                code for code in self._decode_zxing(variant, 2.0) if code.kind == "QR"
+            ]
+            if found:
+                return found[:1]
 
-        x, y, w, h = cv2.boundingRect(points.astype(np.int32))
-        pad = max(10, int(0.3 * max(w, h)))
-        x0, y0 = max(0, x - pad), max(0, y - pad)
-        x1 = min(gray.shape[1], x + w + pad)
-        y1 = min(gray.shape[0], y + h + pad)
-        crop = gray[y0:y1, x0:x1]
-        if crop.size == 0:
-            return "", None
+        # zxing 未命中时再让 zbar 补一次（不同引擎对不同模糊码各有优势）
+        found = [
+            code for code in self._decode_zbar(sharp, 2.0) if code.kind == "QR"
+        ]
+        if found:
+            return found[:1]
 
-        scale = 2.0
-        enlarged = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-        # 补白边，避免裁剪切掉二维码必需的静区
-        pad2 = max(8, int(0.1 * max(enlarged.shape[:2])))
-        padded = cv2.copyMakeBorder(
-            enlarged, pad2, pad2, pad2, pad2, cv2.BORDER_CONSTANT, value=255
-        )
-        data, pts, _ = self._qr.detectAndDecode(padded)
-        if data and pts is not None:
-            pts = (pts.reshape(-1, 2) - pad2) / scale + np.array([x0, y0])
-        return data, pts
-
-    def _decode_qr_contour(self, frame: np.ndarray) -> tuple[str, Optional[np.ndarray]]:
-        """针对深色背景/缺少静区：按亮色区域逐个定位候选码，补白边后解码。"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        # 用较大的闭运算核把码内部的白色模块连成一块，同时排除整幅背景
-        k = max(5, int(min(gray.shape[:2]) * 0.02)) | 1
-        merged = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
-        contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        h_img, w_img = gray.shape[:2]
-        candidates = []
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            if w < 20 or h < 20:
-                continue
-            if not 0.6 <= w / h <= 1.7:  # 二维码接近正方形
-                continue
-            if w * h < 0.002 * w_img * h_img:  # 区域太小不可能是码
-                continue
-            candidates.append((w * h, x, y, w, h))
-
-        for _, x, y, w, h in sorted(candidates, reverse=True)[:3]:
-            crop = gray[y:y + h, x:x + w]
-            pad = max(8, int(0.15 * max(w, h)))
-            padded = cv2.copyMakeBorder(crop, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
-            data, pts, _ = self._qr.detectAndDecode(padded)
+        # zxing/pyzbar 均不可用时，用 OpenCV 常规解码作为降级方案
+        if not _HAS_ZXING and not _HAS_PYZBAR:
+            try:
+                data, points, _ = self._qr.detectAndDecode(gray)
+            except cv2.error:
+                data, points = "", None
             if data:
-                if pts is not None:
-                    pts = pts.reshape(-1, 2) - pad + np.array([x, y])
-                return data, pts
-        return "", None
-
-    def _detect_qr(self, frame: np.ndarray) -> list[DetectedCode]:
-        """OpenCV QRCodeDetector：返回带多边形包围框的二维码。"""
-        data, points = self._decode_qr(frame)
-        if data:
-            self._failed_frames = 0
-            return [self._make_qr(data, points)]
-
-        # 常规解码失败：每隔 retry_every 帧才执行一次较重的兜底策略
-        self._failed_frames += 1
-        if self._failed_frames < self._retry_every:
-            return []
-        self._failed_frames = 0
-
-        # 小码/远距离：先定位码区域，裁剪放大后解码
-        data, points = self._decode_qr_roi(frame)
-        if data:
-            return [self._make_qr(data, points)]
-
-        # 深色背景/缺少静区：按亮色区域定位并补白边
-        data, points = self._decode_qr_contour(frame)
-        if data:
-            return [self._make_qr(data, points)]
+                return [self._make_qr(data, points)]
 
         # 曲面/畸变码
-        data, points = self._decode_qr_curved(frame)
+        data, points = self._decode_qr_curved(gray)
         if data:
             return [self._make_qr(data, points)]
-
-        # 最后尝试二值化 / 反色 / 自适应阈值 / 锐化放大等增强图像
-        for variant, scale in self._enhance_variants(frame):
-            data, points = self._decode_qr(variant)
-            if data:
-                return [self._make_qr(data, points, scale)]
         return []
-
-    def _enhance_variants(self, frame: np.ndarray) -> list[tuple[np.ndarray, float]]:
-        """生成增强图像及其坐标缩放比例（用于把包围框映射回原图）。"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
-
-        _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        adaptive = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5
-        )
-
-        variants: list[tuple[np.ndarray, float]] = []
-        # 补白边：很多二维码（截图、贴边、深色背景）缺少静区导致无法定位
-        pad = max(8, int(0.08 * max(gray.shape[:2])))
-        variants.append(
-            (cv2.copyMakeBorder(gray, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255), 1.0)
-        )
-        variants.extend([
-            (otsu, 1.0),                    # 光照不均、整体偏暗
-            (cv2.bitwise_not(gray), 1.0),   # 深底浅色的反色码
-            (adaptive, 1.0),                # 局部过曝/阴影
-        ])
-
-        # 锐化提升模糊码边缘；窄画面再放大 2 倍，帮助识别远距离小码
-        sharp = cv2.addWeighted(
-            gray, 2.0, cv2.GaussianBlur(gray, (0, 0), 3), -1.0, 0
-        )
-        variants.append((sharp, 1.0))
-        if gray.shape[1] < 960:
-            variants.append(
-                (cv2.resize(sharp, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC), 2.0)
-            )
-        return variants
-
-    def _detect_barcode(self, gray: np.ndarray) -> list[DetectedCode]:
-        """pyzbar：识别一维条码，返回其边界矩形与文本。"""
-        out = []
-        for obj in pyzbar.decode(gray):
-            data = obj.data.decode("utf-8", errors="replace")
-            x, y, w, h = obj.rect.left, obj.rect.top, obj.rect.width, obj.rect.height
-            pts = np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]])
-            out.append(DetectedCode(kind="BARCODE", points=pts, data=data, rect=(x, y, w, h)))
-        return out
