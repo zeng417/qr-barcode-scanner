@@ -6,10 +6,9 @@
 ## 功能
 
 - 实时摄像头画面，自动检测码区域
-- 二维码识别（OpenCV 内置 `QRCodeDetector`）
-- 一维条形码识别（`pyzbar`，需系统 zbar 库）
+- 二维码与一维条码识别（zxing-cpp 主引擎，pyzbar 与 OpenCV `QRCodeDetector` 补充）
 - 在画面绘制多边形包围框并展示解码文本
-- 识别失败时自动尝试区域裁剪放大、补白边、曲面解码、二值化、反色、自适应阈值与锐化，提升小码/缺少静区/反色/模糊/光照不均场景的识别率
+- 识别失败时自动放大画面并锐化/二值化后重试，提升小码、模糊、远距离场景的识别率
 - 识别成功打印结果并写入 CSV 持久化存储
 - 可选：识别到 `http(s)` 链接自动打开浏览器
 
@@ -26,12 +25,11 @@ python3 -m venv venv && source venv/bin/activate
 
 pip install -r requirements.txt
 
-# 一维条形码需要 pyzbar 与系统 zbar 库（可选，仅二维码可跳过）
+# pyzbar 为备用解码引擎，需要系统 zbar 库（可选，缺少时自动降级为 zxing-cpp + OpenCV）
 sudo apt install libzbar0
-pip install pyzbar
 ```
 
-> 未安装 pyzbar 时程序仍可运行，仅降级为二维码识别。
+> 未安装 pyzbar 时程序仍可运行，由 zxing-cpp 与 OpenCV 完成识别。
 
 ## 使用
 
@@ -40,6 +38,7 @@ python -m qr_barcode.main
 ```
 
 - 对准二维码 / 条形码，识别结果实时显示在画面左上角并打印到终端
+- 窗口按当前显示器分辨率自动选择合适的初始大小（可用鼠标拖拽缩放）
 - 每帧识别到的码会自动追加到 `records/history.csv`
 - 按 `Q` 或 `Esc` 退出；按 `S` 保存当前画面到 `records/`，用于排查识别失败
 
