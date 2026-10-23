@@ -18,3 +18,13 @@ RECORD_CSV = "records/history.csv"
 
 # CSV 表头
 CSV_HEADER = ["timestamp", "type", "content"]
+
+# MQTT 推送：把识别结果发布到 Broker，便于接入 IoT / 机器人（默认关闭）
+MQTT_ENABLED = False
+MQTT_BROKER = "127.0.0.1"
+MQTT_PORT = 1883
+MQTT_TOPIC = "qr_barcode/scans"
+MQTT_CLIENT_ID = ""  # 留空则自动生成
+MQTT_USERNAME = ""
+MQTT_PASSWORD = ""
+MQTT_QOS = 1
