@@ -10,6 +10,7 @@
 - 在画面绘制多边形包围框并展示解码文本
 - 识别失败时自动放大画面并锐化/二值化后重试，提升小码、模糊、远距离场景的识别率
 - 识别成功打印结果并写入 CSV 持久化存储
+- 可选：识别结果通过 MQTT 推送到 Broker，便于接入 IoT / 机器人
 - 可选：识别到 `http(s)` 链接自动打开浏览器
 
 ## 环境要求
@@ -53,6 +54,10 @@ python -m qr_barcode.main
 | `DETECT_EVERY_N_FRAMES` | 未检测到码时，间隔多少帧再重试 | `1` |
 | `AUTO_OPEN_URL` | 识别到链接时自动打开浏览器 | `True` |
 | `RECORD_CSV` | 历史记录文件路径 | `records/history.csv` |
+| `MQTT_ENABLED` | 是否启用 MQTT 推送 | `False` |
+| `MQTT_BROKER` / `MQTT_PORT` | MQTT Broker 地址与端口 | `127.0.0.1` / `1883` |
+| `MQTT_TOPIC` | 识别结果发布主题 | `qr_barcode/scans` |
+| `MQTT_USERNAME` / `MQTT_PASSWORD` | Broker 认证信息，留空表示匿名 | 空 |
 
 ## 项目结构
 
@@ -61,10 +66,26 @@ qr_barcode/
   config.py      # 配置项
   detector.py    # QR + 一维条码检测
   recorder.py    # CSV 持久化记录
+  publisher.py   # MQTT 结果推送
   main.py        # 摄像头实时主程序
 records/         # 运行时生成的识别历史
 ```
 
-## 扩展方向
+## MQTT 推送（IoT / 机器人接入）
 
-- 识别结果通过 MQTT 推送，嵌入 IoT / 机器人场景
+在 [config.py](qr_barcode/config.py) 中设置 `MQTT_ENABLED = True` 并填写 Broker 地址，
+每次识别到新码时会向 `MQTT_TOPIC` 发布一条 JSON：
+
+```json
+{"timestamp": "2026-10-23T17:30:00", "type": "QR", "content": "https://example.com"}
+```
+
+本地可用 mosquitto 验证：
+
+```bash
+sudo apt install mosquitto mosquitto-clients
+mosquitto_sub -h 127.0.0.1 -t qr_barcode/scans
+```
+
+Broker 断开时推送会自动重连，期间识别与记录功能不受影响；
+未安装 `paho-mqtt` 时程序会提示并自动关闭推送。
