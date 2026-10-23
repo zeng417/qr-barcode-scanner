@@ -2,7 +2,7 @@
 
 功能：
 - 摄像头实时画面
-- 自动识别二维码(OpenCV QRCodeDetector) 与一维条码(pyzbar)
+- 自动识别二维码与一维条码（zxing-cpp / pyzbar / OpenCV）
 - 在画面绘制包围框并显示解码文本
 - 识别结果打印并写入 CSV
 - 可选：识别到链接自动打开浏览器
@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import os
+import re
+import subprocess
 import time
 import webbrowser
 
@@ -35,9 +37,45 @@ BOX_COLORS = {
 
 WINDOW_NAME = "QR / Barcode Scanner"
 
+# 窗口初始大小占屏幕的比例，避免一打开就过小或超出屏幕
+WINDOW_SCREEN_RATIO = 0.85
+WINDOW_MAX_WIDTH = 1600
+
+
+def screen_size() -> tuple[int, int]:
+    """获取主显示器分辨率，获取失败时返回 1920x1080。"""
+    # xrandr 适用于 X11；部分 Wayland 会话下取不到时退回 xdpyinfo
+    for cmd, pattern in (
+        (["xrandr", "--current"], r"current (\d+) x (\d+)"),
+        (["xdpyinfo"], r"dimensions:\s+(\d+)x(\d+)"),
+    ):
+        try:
+            out = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=2,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        match = re.search(pattern, out)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+    return 1920, 1080
+
+
+def window_size(frame_w: int, frame_h: int) -> tuple[int, int]:
+    """按画面比例计算合适的初始窗口尺寸。"""
+    screen_w, screen_h = screen_size()
+    width = min(int(screen_w * WINDOW_SCREEN_RATIO), WINDOW_MAX_WIDTH)
+    height = round(width * frame_h / frame_w)
+    if height > int(screen_h * WINDOW_SCREEN_RATIO):
+        height = int(screen_h * WINDOW_SCREEN_RATIO)
+        width = round(height * frame_w / frame_h)
+    return width, height
+
 
 def draw_code(frame, code: DetectedCode) -> None:
     """在画面上绘制包围框与解码文本。"""
+    if code.points is None:
+        return
     color = BOX_COLORS.get(code.kind, (0, 0, 255))
     poly = code.points.reshape(-1, 2)
     cv2.polylines(frame, [poly], isClosed=True, color=color, thickness=2)
@@ -65,9 +103,10 @@ def main() -> int:
     recorder = CsvRecorder(RECORD_CSV, CSV_HEADER)
     opened_links: set[str] = set()
 
+    print(f"[信息] 解码引擎: {' + '.join(detector.engines)}")
     if not detector.barcode_supported:
-        print("[提示] pyzbar 未安装，仅支持二维码识别。"
-              "可执行: pip install pyzbar (需系统 zbar 库)")
+        print("[提示] zxing-cpp/pyzbar 均未安装，仅支持二维码识别。"
+              "可执行: pip install -r requirements.txt")
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
@@ -81,12 +120,11 @@ def main() -> int:
           f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
 
     print("按 Q / Esc 退出，按 S 保存当前画面用于排查。")
-    # 使用精简窗口，隐藏 OpenCV 自带的缩放/保存等工具栏按钮
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_GUI_NORMAL)
 
     codes: list[DetectedCode] = []
     active: set[tuple[str, str]] = set()  # 当前画面中的码，用于去重
     detect_cooldown = 0
+    window_ready = False
 
     try:
         while True:
@@ -94,6 +132,19 @@ def main() -> int:
             if not ok:
                 print("[错误] 读取摄像头画面失败")
                 break
+
+            # 首帧到达后再按画面比例确定窗口初始尺寸
+            if not window_ready:
+                h, w = frame.shape[:2]
+                win_w, win_h = window_size(w, h)
+                # 使用精简窗口（隐藏 OpenCV 自带工具栏按钮），并保持画面比例
+                cv2.namedWindow(
+                    WINDOW_NAME,
+                    cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_NORMAL,
+                )
+                cv2.resizeWindow(WINDOW_NAME, win_w, win_h)
+                print(f"[信息] 窗口尺寸: {win_w}x{win_h}")
+                window_ready = True
 
             # 无码时才按 DETECT_EVERY_N_FRAMES 间隔重试，避免空转消耗 CPU
             if detect_cooldown > 0:
