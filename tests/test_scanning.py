@@ -87,6 +87,54 @@ class DeduplicatorTests(unittest.TestCase):
         self.dedup.update([])
         self.assertEqual(self.dedup._tracks, [])
 
+    def test_barcode_needs_consecutive_confirmations_but_qr_is_immediate(self):
+        dedup = ScanDeduplicator(barcode_confirmations=3)
+        bar = self.make_code(kind='BARCODE', data='4006381333931')
+        self.assertEqual(dedup.update([bar, self.code]), [self.code])
+        self.assertEqual(dedup.visible_codes, [self.code])
+        self.assertEqual(dedup.update([bar, self.code]), [])
+        self.assertEqual(dedup.update([bar, self.code]), [bar])
+        self.assertEqual(dedup.visible_codes, [bar, self.code])
+        self.assertEqual(dedup.update([bar, self.code]), [])
+
+    def test_fluctuating_ean_values_do_not_accumulate_confirmation_hits(self):
+        dedup = ScanDeduplicator(barcode_confirmations=3)
+        # 日志中的值均通过 EAN 校验位，但交替出现不能当作可靠识别。
+        for data in ['4006381333931', '9000384333931', '1029387333937'] * 3:
+            self.assertEqual(dedup.update([self.make_code(kind='BARCODE', data=data)]), [])
+            self.assertEqual(dedup.visible_codes, [])
+
+    def test_unconfirmed_barcode_resets_hits_on_miss_even_with_miss_tolerance(self):
+        dedup = ScanDeduplicator(max_missed_detections=1, barcode_confirmations=3)
+        bar = self.make_code(kind='BARCODE')
+        dedup.update([bar])
+        dedup.update([bar])
+        dedup.update([])
+        self.assertEqual(dedup.update([bar]), [])
+        self.assertEqual(dedup.update([bar]), [])
+        self.assertEqual(dedup.update([bar]), [bar])
+
+    def test_identical_barcode_instances_confirm_independently_and_reconfirm_on_return(self):
+        dedup = ScanDeduplicator(barcode_confirmations=3)
+        left, right = self.make_code(kind='BARCODE'), self.make_code(100, kind='BARCODE')
+        dedup.update([left])
+        self.assertEqual(dedup.update([left, right]), [])
+        self.assertEqual(dedup.update([right, left]), [left])
+        self.assertEqual(dedup.update([left, right]), [right])
+        dedup.update([right])
+        self.assertEqual(dedup.update([right, left]), [])
+        self.assertEqual(dedup.update([left, right]), [])
+        self.assertEqual(dedup.update([right, left]), [left])
+
+    def test_unconfirmed_barcode_cannot_transfer_hits_to_a_distant_instance(self):
+        dedup = ScanDeduplicator(barcode_confirmations=3)
+        dedup.update([self.make_code(kind='BARCODE')])
+        dedup.update([self.make_code(kind='BARCODE')])
+        distant = self.make_code(100, kind='BARCODE')
+        self.assertEqual(dedup.update([distant]), [])
+        self.assertEqual(dedup.update([distant]), [])
+        self.assertEqual(dedup.update([distant]), [distant])
+
 
 class WorkerTests(unittest.TestCase):
     def test_close_drains_completed_and_in_progress_results_without_deadlock(self):

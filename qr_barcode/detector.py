@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from copy import copy
 import time
 from typing import Optional
 
@@ -39,7 +40,8 @@ class DetectedCode:
     points: Optional[np.ndarray | list]  # 构造时接受列表，内部统一为 Nx2 int32 数组
     data: str
     rect: Optional[tuple] = None  # 条码的近似矩形 (x, y, w, h)
-    source: str = ""  # 跨引擎同位置的内容冲突按引擎优先级处理
+    source: str = ""  # 二维码内容冲突按引擎优先级处理，一维码内容冲突暂缓
+    confirmed_by: frozenset[str] = frozenset()  # 同一帧同一位置同内容的引擎证据
 
     def __post_init__(self) -> None:
         if self.points is not None:
@@ -54,13 +56,16 @@ class CodeDetector:
     合并各引擎结果，均失败后限频执行补白边、放大/二值化兜底。
     """
 
-    def __init__(self, retry_every: int = 5, retry_interval: float = 0.5) -> None:
+    def __init__(self, retry_every: int = 5, retry_interval: float = 0.5,
+                 require_barcode_agreement: bool = False) -> None:
         self._qr = cv2.QRCodeDetector()
+        self._require_barcode_agreement = require_barcode_agreement
         # 连续无码达到 retry_every 次检测且满足时间间隔后，才执行增强识别
         self._retry_every = max(1, retry_every)
         self._failed_frames = 0
         self._retry_interval = max(0.0, retry_interval)
         self._last_retry = float("-inf")
+        self._barcode_enhancement_active = False
 
     @property
     def barcode_supported(self) -> bool:
@@ -86,19 +91,34 @@ class CodeDetector:
         results.extend(self._decode_opencv(gray))
         if not results:
             results.extend(self._decode_qr_regions(gray))
-        if results:
+        accepted = self._accepted_results(results)
+        if accepted and not (self._barcode_enhancement_active
+                             and not any(code.kind == 'BARCODE' for code in accepted)):
+            self._barcode_enhancement_active = False
             self._failed_frames = 0
-            return self._merge_results(results)
+            return accepted
 
-        # 仅在完全无码时增强；帧数和时间双重限频。
+        # 没有可接受的结果时增强；原始候选被过滤后也必须允许重试。
         self._failed_frames += 1
         now = time.monotonic()
-        if (self._failed_frames >= self._retry_every
-                and now - self._last_retry >= self._retry_interval):
+        if (self._barcode_enhancement_active
+                or (self._failed_frames >= self._retry_every
+                    and now - self._last_retry >= self._retry_interval)):
             self._failed_frames = 0
             self._last_retry = now
             results.extend(self._detect_qr_fallback(gray))
-        return self._merge_results(results)
+            accepted = self._accepted_results(results)
+            # 增强后才能读出的条码必须在后续帧继续尝试增强，否则中间空帧
+            # 会打断事件层的连续确认，导致永远不能上报。增强再次失败即恢复限频。
+            self._barcode_enhancement_active = any(code.kind == 'BARCODE' for code in accepted)
+        return accepted
+
+    def _accepted_results(self, results: list[DetectedCode]) -> list[DetectedCode]:
+        merged = self._merge_results(results)
+        if self._require_barcode_agreement and _HAS_ZXING and _HAS_PYZBAR:
+            merged = [code for code in merged if code.kind != 'BARCODE'
+                      or {'zxing-cpp', 'pyzbar'} <= code.confirmed_by]
+        return merged
 
     def _decode_qr_regions(self, gray: np.ndarray) -> list[DetectedCode]:
         """原图失败时提取深色背景上的码，再将区域中的识别框映射回原图。"""
@@ -117,11 +137,52 @@ class CodeDetector:
         return self._merge_results(found)
 
     @staticmethod
+    def _box_iou(first: DetectedCode, second: DetectedCode) -> float:
+        if first.points is None or second.points is None:
+            return 0.0
+        lo = np.maximum(first.points.min(axis=0), second.points.min(axis=0))
+        hi = np.minimum(first.points.max(axis=0), second.points.max(axis=0))
+        intersection = float(np.prod(np.maximum(hi - lo, 0)))
+        area = float(np.prod(np.ptp(first.points, axis=0)))
+        second_area = float(np.prod(np.ptp(second.points, axis=0)))
+        union = area + second_area - intersection
+        return intersection / union if union > 0 else 0.0
+
+    @staticmethod
+    def _same_region(first: DetectedCode, second: DetectedCode) -> bool:
+        if CodeDetector._box_iou(first, second) >= 0.7:
+            return True
+        # 一维码的扫描线覆盖范围常因引擎而异：一个框可能仅覆盖另一个框
+        # 的部分宽度或高度。只对两个已知引擎使用较小框覆盖率来关联。
+        if (first.kind != 'BARCODE' or second.kind != 'BARCODE'
+                or {first.source, second.source} != {'zxing-cpp', 'pyzbar'}
+                or first.points is None or second.points is None):
+            return False
+        lo = np.maximum(first.points.min(axis=0), second.points.min(axis=0))
+        hi = np.minimum(first.points.max(axis=0), second.points.max(axis=0))
+        intersection = float(np.prod(np.maximum(hi - lo, 0)))
+        smaller = min(float(np.prod(np.ptp(first.points, axis=0))),
+                      float(np.prod(np.ptp(second.points, axis=0))))
+        return smaller > 0 and intersection / smaller >= 0.8
+
+    @staticmethod
     def _merge_results(codes: list[DetectedCode]) -> list[DetectedCode]:
-        """以外接框标准 IoU >= 0.7 合并重复框；跨引擎同位置内容冲突时优先 ZXing。"""
+        """合并同位置重复框；一维码同位置内容冲突时全部暂缓。"""
         merged: list[DetectedCode] = []
+        rejected = set()
+        for index, code in enumerate(codes):
+            if code.kind != 'BARCODE':
+                continue
+            for other_index in range(index + 1, len(codes)):
+                other = codes[other_index]
+                if (other.kind == 'BARCODE' and code.data != other.data
+                        and CodeDetector._same_region(code, other)):
+                    rejected.update((index, other_index))
         priority = {"zxing-cpp": 0, "pyzbar": 1, "OpenCV": 2}
-        for code in sorted(codes, key=lambda item: priority.get(item.source, 3)):
+        accepted = [code for index, code in enumerate(codes) if index not in rejected]
+        for candidate in sorted(accepted, key=lambda item: priority.get(item.source, 3)):
+            # 合并证据只写入输出副本，不能给上游对象留下跨帧的引擎证据。
+            code = copy(candidate)
             duplicate = False
             for existing in merged:
                 if code.kind != existing.kind:
@@ -132,13 +193,10 @@ class CodeDetector:
                 if code.points is None or existing.points is None:
                     # 缺少位置时无法判断是否为同一实体，保留结果供事件层关联。
                     continue
-                lo = np.maximum(code.points.min(axis=0), existing.points.min(axis=0))
-                hi = np.minimum(code.points.max(axis=0), existing.points.max(axis=0))
-                intersection = float(np.prod(np.maximum(hi - lo, 0)))
-                area = float(np.prod(np.ptp(code.points, axis=0)))
-                existing_area = float(np.prod(np.ptp(existing.points, axis=0)))
-                union = area + existing_area - intersection
-                if union > 0 and intersection / union >= 0.7:
+                if CodeDetector._same_region(code, existing):
+                    if code.kind == 'BARCODE' and code.data == existing.data:
+                        existing.confirmed_by = (existing.confirmed_by | code.confirmed_by
+                                                 | {existing.source, code.source}) - {''}
                     duplicate = True
                     break
             if not duplicate:

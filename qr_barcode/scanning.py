@@ -109,18 +109,23 @@ class DetectionWorker:
 class _CodeTrack:
     code: DetectedCode
     missed: int = 0
+    hits: int = 1
+    reported: bool = False
 
 
 class ScanDeduplicator:
-    """按类型、内容及位置一对一关联；新实例和离开后重现的实例生成事件。"""
+    """按类型、内容及位置关联；一维码可要求连续确认后才显示并生成事件。"""
 
     def __init__(self, max_missed_detections: int = 0,
-                 max_center_distance: float = 0.75) -> None:
-        if max_missed_detections < 0 or max_center_distance <= 0:
+                 max_center_distance: float = 0.75,
+                 barcode_confirmations: int = 1) -> None:
+        if max_missed_detections < 0 or max_center_distance <= 0 or barcode_confirmations < 1:
             raise ValueError("Invalid tracking miss limit or center distance")
         self.max_missed_detections = max_missed_detections
         self.max_center_distance = max_center_distance
+        self.barcode_confirmations = barcode_confirmations
         self._tracks: list[_CodeTrack] = []
+        self.visible_codes: list[DetectedCode] = []
 
     def _distance(self, previous: DetectedCode, current: DetectedCode) -> float | None:
         if (previous.kind, previous.data) != (current.kind, current.data):
@@ -167,20 +172,30 @@ class ScanDeduplicator:
             assign(new_index, set())
 
         fresh, tracks = [], []
+        self.visible_codes = []
         for new_index, code in enumerate(codes):
             if new_index in matches:
                 track = self._tracks[matches[new_index]]
                 if code.points is not None:
                     track.code = code
                 track.missed = 0
+                track.hits += 1
             else:
-                fresh.append(code)
                 track = _CodeTrack(code)
+            required = self.barcode_confirmations if code.kind == 'BARCODE' else 1
+            if not track.reported and track.hits >= required:
+                fresh.append(code)
+                track.reported = True
+            if track.reported:
+                self.visible_codes.append(code)
             tracks.append(track)
 
         for old_index, track in enumerate(self._tracks):
             if old_index not in matched_old:
                 track.missed += 1
+                # 尚未确认的候选必须连续命中；容忍漏检不能累积零散错误。
+                if not track.reported:
+                    track.hits = 0
                 if track.missed <= self.max_missed_detections:
                     tracks.append(track)
         self._tracks = tracks

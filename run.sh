@@ -20,4 +20,4 @@ if ! "$PY" -c "import cv2, numpy, zxingcpp" >/dev/null 2>&1; then
     "$PY" -m pip install -r requirements.txt
 fi
 
-exec "$PY" -m qr_barcode.main
+exec "$PY" -m qr_barcode.main "$@"

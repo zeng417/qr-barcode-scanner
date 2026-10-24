@@ -17,11 +17,17 @@ import sqlite3
 import time
 import webbrowser
 import uuid
+import argparse
+from pathlib import Path
 
 import cv2
+import numpy as np
 
 from .config import (
     AUTO_OPEN_URL,
+    BARCODE_CONSOLE_INTERVAL_SECONDS,
+    BARCODE_CONFIRM_DETECTIONS,
+    BARCODE_REQUIRE_ENGINE_AGREEMENT,
     CAMERA_HEIGHT,
     CAMERA_READ_FAILURE_LIMIT,
     CAMERA_RETRY_DELAY,
@@ -164,9 +170,65 @@ def save_snapshot(frame, directory: str) -> bool:
     return True
 
 
+def window_visible() -> bool:
+    """Qt 在关闭最后一个窗口后会抛 NULL guiReceiver，按正常关闭处理。"""
+    try:
+        return cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) >= 1
+    except cv2.error as exc:
+        if exc.code == -27 and ('NULL guiReceiver' in str(exc) or 'NULL window' in str(exc)):
+            return False
+        raise
+
+
+def scan_image(path: str, output: str | None = None) -> int:
+    """单张图片立即检测并输出结果；不等待摄像头连续帧，也不打开摄像头或浏览器。"""
+    try:
+        image = cv2.imdecode(np.frombuffer(Path(path).read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError('文件不是可读取的图片')
+        detector = CodeDetector(retry_every=1, retry_interval=0,
+                                require_barcode_agreement=BARCODE_REQUIRE_ENGINE_AGREEMENT)
+        codes = detector.detect(image)
+    except (OSError, ValueError, cv2.error) as exc:
+        print(f"[错误] 图片识别失败: {path}: {exc}")
+        return 1
+    if not codes:
+        print(f"[未识别] 图片中没有读出有效的二维码或一维码: {path}")
+        return 3
+    for code in codes:
+        print(f"[{code.kind}] {code.data}")
+    if output is not None:
+        try:
+            if Path(path).resolve() == Path(output).resolve():
+                raise ValueError('标注图路径必须与输入图片不同')
+            for code in codes:
+                draw_code(image, code)
+            if not cv2.imwrite(output, image):
+                raise OSError('图像编码器未能写入标注图片')
+        except (OSError, ValueError, cv2.error) as exc:
+            print(f"[错误] 保存标注图片失败: {exc}")
+            return 2
+        print(f"[完成] 标注图片已保存: {output}")
+    return 0
+
+
+def cli(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description='二维码与一维码识别：摄像头或图片文件')
+    parser.add_argument('--image', metavar='PATH', help='识别指定图片并打印结果，无需摄像头')
+    parser.add_argument('--output', metavar='PATH', help='图片模式中保存识别框标注图')
+    args = parser.parse_args(argv)
+    if args.output and not args.image:
+        parser.error('--output 需要同时指定 --image')
+    if args.image:
+        return scan_image(args.image, args.output)
+    return main()
+
+
 def main() -> int:
-    detector = CodeDetector(ENHANCE_EVERY_N_DETECTIONS, ENHANCE_INTERVAL_SECONDS)
-    deduplicator = ScanDeduplicator(SCAN_MAX_MISSED_DETECTIONS, SCAN_MAX_CENTER_DISTANCE)
+    detector = CodeDetector(ENHANCE_EVERY_N_DETECTIONS, ENHANCE_INTERVAL_SECONDS,
+                            BARCODE_REQUIRE_ENGINE_AGREEMENT)
+    deduplicator = ScanDeduplicator(SCAN_MAX_MISSED_DETECTIONS, SCAN_MAX_CENTER_DISTANCE,
+                                   BARCODE_CONFIRM_DETECTIONS)
     try:
         publisher = create_publisher()
     except (OSError, sqlite3.Error, ValueError) as exc:
@@ -178,6 +240,7 @@ def main() -> int:
                              on_record=publisher.wake if publisher is not None else None,
                              close_timeout=STORAGE_CLOSE_TIMEOUT)
     opened_links: set[str] = set()
+    barcode_console_at: dict[str, float] = {}
     codes: list[DetectedCode] = []
     result_at = float("-inf")
     status = 0
@@ -190,9 +253,18 @@ def main() -> int:
             print(f"[错误] 后台识别失败: {result.error}")
             status = 1
             return
-        codes, result_at = result.codes, result.captured_at
-        for code in deduplicator.update(codes):
-            print(f"[{code.kind}] {code.data}")
+        fresh = deduplicator.update(result.codes)
+        codes, result_at = deduplicator.visible_codes, result.captured_at
+        console_now = time.monotonic()
+        # 清理过期内容，长期运行时不累积所有扫过的条码。
+        for data, printed_at in list(barcode_console_at.items()):
+            if console_now - printed_at >= BARCODE_CONSOLE_INTERVAL_SECONDS:
+                del barcode_console_at[data]
+        for code in fresh:
+            if code.kind != 'BARCODE' or code.data not in barcode_console_at:
+                print(f"[{code.kind}] {code.data}")
+                if code.kind == 'BARCODE' and BARCODE_CONSOLE_INTERVAL_SECONDS > 0:
+                    barcode_console_at[code.data] = console_now
             if not recorder.add(code.kind, code.data):
                 print("[错误] 扫描事件未能进入存储缓冲，请检查磁盘和缓冲容量。")
                 status = 2
@@ -256,7 +328,7 @@ def main() -> int:
                         status = 2
                 if key in (ord('q'), 27):
                     break
-                if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                if not window_visible():
                     break
     except (OSError, cv2.error) as exc:
         print(f"[错误] 采集或显示失败: {exc}")
@@ -284,4 +356,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli())

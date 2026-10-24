@@ -9,7 +9,8 @@ from qr_barcode.scanning import ScanResult
 
 class MainLoopTests(unittest.TestCase):
     def run_main(self, results, publisher=None, completed=(), reads=None, keys=None,
-                 recorder_ok=True, add_ok=True, draw_effect=None):
+                 recorder_ok=True, add_ok=True, draw_effect=None, barcode_confirmations=1,
+                 window_property_effect=None):
         frame = np.zeros((40, 40, 3), dtype=np.uint8)
         capture = Mock()
         capture.isOpened.return_value = True
@@ -40,6 +41,8 @@ class MainLoopTests(unittest.TestCase):
             stack.enter_context(patch.object(module.cv2, 'waitKey', side_effect=(keys if keys is not None
                 else [-1] * (len(results)-1) + [ord('q')])))
             output = stack.enter_context(patch('builtins.print'))
+            stack.enter_context(patch.object(module, 'BARCODE_CONFIRM_DETECTIONS', barcode_confirmations))
+            module.cv2.getWindowProperty.side_effect = window_property_effect
             self.status = module.main()
             refresh_count = module.cv2.imshow.call_count
         return detector, recorder, worker, capture, output, refresh_count
@@ -76,10 +79,72 @@ class MainLoopTests(unittest.TestCase):
         recorder.add.assert_called_once_with('QR', 'last')
         recorder.close.assert_called_once()
 
+    def test_barcode_console_limit_keeps_all_events_and_other_content(self):
+        first = DetectedCode('BARCODE', [[0, 0], [10, 0], [10, 10], [0, 10]], '123')
+        second = DetectedCode('BARCODE', [[25, 0], [35, 0], [35, 10], [25, 10]], '123')
+        different = DetectedCode('BARCODE', None, '456')
+        qr = DetectedCode('QR', None, 'qr')
+        results = [ScanResult(10, [first, second, qr]), ScanResult(10, []),
+                   ScanResult(10, [first, different, qr])]
+        with patch.object(module.time, 'monotonic', return_value=10), \
+                patch.object(module, 'BARCODE_CONSOLE_INTERVAL_SECONDS', 2):
+            _, recorder, _, _, output, _ = self.run_main(results)
+        lines = [call.args[0] for call in output.call_args_list]
+        self.assertEqual(lines.count('[BARCODE] 123'), 1)
+        self.assertEqual(lines.count('[BARCODE] 456'), 1)
+        self.assertEqual(lines.count('[QR] qr'), 2)
+        self.assertEqual(recorder.add.call_count, 6)
+
+    def test_barcode_console_prints_again_after_interval_or_when_disabled(self):
+        code = DetectedCode('BARCODE', None, '123')
+        results = [ScanResult(0, [code]), ScanResult(3, []), ScanResult(3, [code])]
+        for interval in (2, 0):
+            times = [0, 0, 3, 3, 3, 3] if interval else [0] * 6
+            with self.subTest(interval=interval), \
+                    patch.object(module, 'BARCODE_CONSOLE_INTERVAL_SECONDS', interval), \
+                    patch.object(module.time, 'monotonic', side_effect=times):
+                _, recorder, _, _, output, _ = self.run_main(results)
+            lines = [call.args[0] for call in output.call_args_list]
+            self.assertEqual(lines.count('[BARCODE] 123'), 2)
+            self.assertEqual(recorder.add.call_count, 2)
+
     def test_camera_failure_retries_then_returns_nonzero(self):
         _, _, _, capture, _, _ = self.run_main([], reads=[False, False, False], keys=[-1, -1])
         self.assertEqual(capture.read.call_count, 3)
         self.assertEqual(self.status, 1)
+
+    def test_unconfirmed_barcode_is_not_drawn_printed_or_recorded(self):
+        def bar(data):
+            return DetectedCode('BARCODE', None, data)
+
+        correct = bar('4006381333931')
+        results = [ScanResult(10, [bar('9000384333931')]),
+                   ScanResult(10, [bar('1029387333937')])] + [ScanResult(10, [correct])] * 3
+        drawn = []
+        with patch.object(module.time, 'monotonic', return_value=10):
+            _, recorder, _, _, output, _ = self.run_main(results, barcode_confirmations=3,
+                draw_effect=lambda frame, code: drawn.append(code.data))
+        recorder.add.assert_called_once_with('BARCODE', correct.data)
+        self.assertEqual(drawn, [correct.data])
+        barcode_lines = [call.args[0] for call in output.call_args_list
+                         if call.args[0].startswith('[BARCODE]')]
+        self.assertEqual(barcode_lines, ['[BARCODE] ' + correct.data])
+
+    def test_qt_window_close_is_normal_but_other_gui_errors_are_reported(self):
+        import cv2
+
+        closed = cv2.error('NULL guiReceiver (please create a window)')
+        closed.code = -27
+        unexpected = cv2.error('unexpected GUI failure')
+        unexpected.code = -2
+        for error, expected in [(closed, 0), (unexpected, 1)]:
+            with self.subTest(error=error.code):
+                _, recorder, worker, capture, _, _ = self.run_main(
+                    [None], keys=[-1], window_property_effect=error)
+            self.assertEqual(self.status, expected)
+            capture.release.assert_called_once()
+            worker.close.assert_called_once()
+            recorder.close.assert_called_once()
 
     def test_transient_camera_failure_recovers(self):
         self.run_main([None], reads=[False, True], keys=[-1, ord('q')])

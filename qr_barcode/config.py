@@ -22,6 +22,17 @@ SCAN_MAX_MISSED_DETECTIONS = 0
 # 连续检测中允许的中心移动距离，以前后包围框平均对角线长度为单位
 SCAN_MAX_CENTER_DISTANCE = 0.75
 
+# 一维码在同一位置连续多次完整检测内容一致，才显示、打印、保存和上报
+# 计数按检测结果而非摄像头帧；首次出现及离开后重现都需重新确认
+BARCODE_CONFIRM_DETECTIONS = 3
+# 可选严格模式：要求两个引擎均成功；默认关闭，避免一个引擎漏检就屏蔽有效条码
+# 默认允许单引擎候选进入多次确认，同位置内容冲突时仍暂缓
+BARCODE_REQUIRE_ENGINE_AGREEMENT = False
+
+# 同内容一维码的终端输出最小间隔；只控制打印，不影响事件保存和 MQTT
+# 设置为 0 可打印每个新事件
+BARCODE_CONSOLE_INTERVAL_SECONDS = 2.0
+
 # 后台结果超过此时间就不再绘制旧框（秒）
 RESULT_MAX_AGE_SECONDS = 1.0
 DETECTION_CLOSE_TIMEOUT = 1.0

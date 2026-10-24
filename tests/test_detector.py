@@ -172,6 +172,140 @@ class DetectorTests(unittest.TestCase):
         found = self.detector._merge_results([secondary, primary])
         self.assertEqual([c.data for c in found], ['hex:fffe414243'])
 
+    def test_conflicting_barcode_values_are_all_rejected_instead_of_prioritized(self):
+        primary = code('4006381333931', kind='BARCODE')
+        primary.source = 'zxing-cpp'
+        conflicting = code('9000384333931', kind='BARCODE')
+        conflicting.source = 'pyzbar'
+        agreeing_variant = code(primary.data, kind='BARCODE')
+        separate = code('123456789', 100, kind='BARCODE')
+        found = self.detector._merge_results([primary, conflicting, agreeing_variant, separate])
+        self.assertEqual(found, [separate])
+
+    def test_different_barcode_values_at_distinct_positions_are_kept(self):
+        first = code('4006381333931', kind='BARCODE')
+        second = code('9000384333931', 100, kind='BARCODE')
+        self.assertEqual(self.detector._merge_results([first, second]), [first, second])
+
+    def test_strict_barcode_agreement_rejects_single_engine_and_variant_votes(self):
+        detector = CodeDetector(require_barcode_agreement=True)
+        primary = code('4006381333931', kind='BARCODE')
+        primary.source = 'zxing-cpp'
+        secondary = code(primary.data, kind='BARCODE')
+        secondary.source = 'pyzbar'
+        with patch.object(module, '_HAS_ZXING', True), patch.object(module, '_HAS_PYZBAR', True):
+            self.assertEqual(detector._accepted_results([primary]), [])
+            self.assertEqual(detector._accepted_results([primary, primary]), [])
+            found = detector._accepted_results([primary, secondary])
+            self.assertEqual([c.data for c in found], [primary.data])
+            # 下一帧复用原始候选，也不能借用上一帧的双引擎证据。
+            self.assertEqual(detector._accepted_results([primary]), [])
+
+    def test_agreement_is_per_position_and_survives_region_merging(self):
+        detector = CodeDetector(require_barcode_agreement=True)
+        primary = code('4006381333931', kind='BARCODE')
+        primary.source = 'zxing-cpp'
+        secondary = code(primary.data, kind='BARCODE')
+        secondary.source = 'pyzbar'
+        other = code(primary.data, 100, kind='BARCODE')
+        other.source = 'zxing-cpp'
+        intermediate = detector._merge_results([primary, secondary, other])
+        with patch.object(module, '_HAS_ZXING', True), patch.object(module, '_HAS_PYZBAR', True):
+            found = detector._accepted_results(intermediate)
+        self.assertEqual(len(found), 1)
+        np.testing.assert_array_equal(found[0].points, primary.points)
+
+    def test_single_engine_installation_still_accepts_barcodes_for_temporal_confirmation(self):
+        detector = CodeDetector(require_barcode_agreement=True)
+        for zxing, zbar, source in [(True, False, 'zxing-cpp'), (False, True, 'pyzbar')]:
+            candidate = code('4006381333931', kind='BARCODE')
+            candidate.source = source
+            with self.subTest(source=source), patch.object(module, '_HAS_ZXING', zxing), \
+                    patch.object(module, '_HAS_PYZBAR', zbar):
+                self.assertEqual(detector._accepted_results([candidate]), [candidate])
+
+    def test_barcode_agreement_matches_scanline_bounds_of_different_sizes(self):
+        primary = DetectedCode('BARCODE', [[100, 200], [400, 200], [400, 210], [100, 210]],
+                               '4006381333931', source='zxing-cpp')
+        secondary = DetectedCode('BARCODE', [[100, 200], [400, 200], [400, 300], [100, 300]],
+                                 primary.data, source='pyzbar')
+        self.assertLess(CodeDetector._box_iou(primary, secondary), 0.7)
+        with patch.object(module, '_HAS_ZXING', True), patch.object(module, '_HAS_PYZBAR', True):
+            detector = CodeDetector(require_barcode_agreement=True)
+            found = detector._accepted_results([primary, secondary])
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].confirmed_by, {'zxing-cpp', 'pyzbar'})
+        secondary.data = '9000384333931'
+        self.assertEqual(detector._merge_results([primary, secondary]), [])
+
+    def test_barcode_containment_does_not_merge_same_engine_or_disjoint_instances(self):
+        large = DetectedCode('BARCODE', [[0, 0], [100, 0], [100, 100], [0, 100]],
+                             'A', source='zxing-cpp')
+        small = DetectedCode('BARCODE', [[0, 0], [100, 0], [100, 10], [0, 10]],
+                             'A', source='zxing-cpp')
+        separate = DetectedCode('BARCODE', [[0, 110], [100, 110], [100, 120], [0, 120]],
+                                'A', source='pyzbar')
+        self.assertEqual(len(self.detector._merge_results([large, small, separate])), 3)
+
+    def test_filtered_candidates_do_not_prevent_enhancement_retry(self):
+        detector = CodeDetector(retry_every=1, require_barcode_agreement=True)
+        primary = code('4006381333931', kind='BARCODE')
+        primary.source = 'zxing-cpp'
+        secondary = code(primary.data, kind='BARCODE')
+        secondary.source = 'pyzbar'
+        detector._decode_zxing = Mock(return_value=[primary])
+        detector._decode_zbar = Mock(return_value=[])
+        detector._decode_opencv = Mock(return_value=[])
+        detector._detect_qr_fallback = Mock(return_value=[secondary])
+        with patch.object(module, '_HAS_ZXING', True), patch.object(module, '_HAS_PYZBAR', True):
+            found = detector.detect(self.image)
+        self.assertEqual([c.data for c in found], [primary.data])
+        detector._detect_qr_fallback.assert_called_once()
+
+    @unittest.skipUnless(module._HAS_ZXING and module._HAS_PYZBAR,
+                         'Requires both barcode decoders for camera-style regression')
+    def test_camera_style_ean_different_bounds_and_single_decoder_can_confirm(self):
+        from qr_barcode.config import BARCODE_REQUIRE_ENGINE_AGREEMENT, BARCODE_CONFIRM_DETECTIONS
+        from qr_barcode.scanning import ScanDeduplicator
+
+        barcode = np.asarray(module.zxingcpp.write_barcode(
+            module.zxingcpp.BarcodeFormat.EAN13, '4006381333931', 400, 160))
+        # 缩小、旋转和轻微模糊，复现扫描范围不一致或只有一个引擎成功。
+        for width, height, blur, angle in ((220, 100, 3, 0), (220, 100, 3, 25),
+                                           (400, 160, 5, 25)):
+            with self.subTest(width=width, angle=angle):
+                scene = np.full((720, 1280), 180, np.uint8)
+                scene[250:250+height, 400:400+width] = cv2.resize(
+                    barcode, (width, height), interpolation=cv2.INTER_AREA)
+                scene = cv2.warpAffine(scene, cv2.getRotationMatrix2D((600, 360), angle, 1),
+                                       (1280, 720), borderValue=180)
+                scene = cv2.GaussianBlur(scene, (blur, blur), 0)
+                detector = CodeDetector(require_barcode_agreement=BARCODE_REQUIRE_ENGINE_AGREEMENT)
+                dedup = ScanDeduplicator(barcode_confirmations=BARCODE_CONFIRM_DETECTIONS)
+                for index in range(BARCODE_CONFIRM_DETECTIONS):
+                    found = detector.detect(scene)
+                    self.assertEqual([c.data for c in found], ['4006381333931'])
+                    fresh = dedup.update(found)
+                    self.assertEqual([c.data for c in fresh],
+                        ['4006381333931'] if index == BARCODE_CONFIRM_DETECTIONS - 1 else [])
+
+    @unittest.skipUnless(module._HAS_ZXING and module._HAS_PYZBAR,
+                         'Requires both barcode decoders for strict integration')
+    def test_real_ean_and_code128_pass_agreement_and_three_detection_confirmation(self):
+        from qr_barcode.scanning import ScanDeduplicator
+
+        for format_, payload in [(module.zxingcpp.BarcodeFormat.EAN13, '4006381333931'),
+                                 (module.zxingcpp.BarcodeFormat.Code128, '001234567890')]:
+            with self.subTest(format=format_):
+                image = np.asarray(module.zxingcpp.write_barcode(format_, payload, 400, 160))
+                detector = CodeDetector(require_barcode_agreement=True)
+                dedup = ScanDeduplicator(barcode_confirmations=3)
+                for index in range(3):
+                    found = detector.detect(image)
+                    self.assertEqual([c.data for c in found], [payload])
+                    fresh = dedup.update(found)
+                    self.assertEqual([c.data for c in fresh], [payload] if index == 2 else [])
+
     def test_enhancement_keeps_all_codes_and_merges_across_variants(self):
         self.detector._decode_zxing = Mock(side_effect=[[code("A"), code("B", 40)], [code("A")]])
         self.detector._decode_zbar = Mock(return_value=[code("C", 80, "BARCODE")])
@@ -200,6 +334,24 @@ class DetectorTests(unittest.TestCase):
             for _ in range(5):
                 detector.detect(self.image)
         self.assertEqual(detector._detect_qr_fallback.call_count, 2)
+
+    def test_enhancement_only_barcode_can_reach_confirmation_then_empty_frames_restore_limit(self):
+        from qr_barcode.scanning import ScanDeduplicator
+
+        detector = CodeDetector(retry_every=2, retry_interval=100)
+        # 每次解码返回新的列表，避免 detect() 合并结果时污染后续模拟帧。
+        detector._decode_zxing = Mock(side_effect=lambda image: [])
+        detector._decode_zbar = Mock(return_value=[])
+        detector._decode_opencv = Mock(return_value=[])
+        candidate = code('ABC-2024-001', kind='BARCODE')
+        detector._detect_qr_fallback = Mock(side_effect=[[candidate], [candidate], [candidate], []])
+        dedup = ScanDeduplicator(barcode_confirmations=3)
+        events = []
+        with patch.object(module.time, 'monotonic', side_effect=[0, .1, .2, .3, .4, .5, .6]):
+            for _ in range(7):
+                events.append([c.data for c in dedup.update(detector.detect(self.image))])
+        self.assertEqual(events, [[], [], [], ['ABC-2024-001'], [], [], []])
+        self.assertEqual(detector._detect_qr_fallback.call_count, 4)
 
     @unittest.skipUnless(module._HAS_ZXING, "zxing-cpp not installed")
     def test_real_mixed_qr_and_barcode_image(self):
