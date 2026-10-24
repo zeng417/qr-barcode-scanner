@@ -175,6 +175,70 @@ class PublisherTests(unittest.TestCase):
             publisher.close()
         self.assertFalse(Path(self.path).exists())
 
+    def replacement_factory(self, **kwargs):
+        client = FakeClient(**kwargs)
+        client.online.set()
+        client.auto_ack = True
+        self.clients.append(client)
+        return client
+
+    def test_ack_timeout_reconnects_and_retries_same_event_id(self):
+        publisher = self.publisher(ack_timeout=.05)
+        original = self.clients[-1]
+        original.online.set()
+        module.mqtt.Client = self.replacement_factory
+        publisher.publish('QR', 'A')
+        wait_until(lambda: len(self.clients) >= 2 and publisher.pending_count == 0)
+        replacement = self.clients[-1]
+        self.assertEqual(original.sent[0][2]['event_id'], replacement.sent[0][2]['event_id'])
+        self.assertEqual(original.actions, ['disconnect', 'loop_stop'])
+
+    def test_unacknowledged_event_is_archived_so_next_event_can_send(self):
+        import sqlite3
+        publisher = self.publisher(ack_timeout=.05, max_attempts=1)
+        original = self.clients[-1]
+        original.online.set()
+        module.mqtt.Client = self.replacement_factory
+        with self.assertLogs(module.logger, level='ERROR'):
+            publisher.publish('QR', 'bad')
+            publisher.publish('QR', 'good')
+            wait_until(lambda: len(self.clients) >= 2 and publisher.pending_count == 0)
+        self.assertEqual(self.clients[-1].sent[0][2]['content'], 'good')
+        with sqlite3.connect(self.path) as db:
+            payload = db.execute('SELECT payload FROM mqtt_failures').fetchone()[0]
+            self.assertEqual(json.loads(payload)['content'], 'bad')
+
+    def test_shared_event_store_promotes_deferred_events_and_tracks_delivery(self):
+        import sqlite3
+        from qr_barcode.storage import EventStore
+        publisher = self.publisher(max_pending=1)
+        store = EventStore(self.path, max_pending=1)
+        try:
+            for event_id in ('A', 'B'):
+                store.record(dict(event_id=event_id, timestamp='now', type='QR', content=event_id), 'scans')
+            client = self.clients[-1]
+            client.auto_ack = True
+            client.online.set()
+            publisher.wake()
+            wait_until(lambda: store.db.execute("SELECT COUNT(*) FROM events WHERE state='sent'").fetchone()[0] == 2)
+            self.assertEqual([item[2]['event_id'] for item in client.sent], ['A', 'B'])
+        finally:
+            store.close()
+
+    def test_legacy_outbox_schema_is_migrated_without_losing_pending_messages(self):
+        import sqlite3
+        with sqlite3.connect(self.path) as db:
+            db.execute('CREATE TABLE outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, qos INTEGER, payload TEXT)')
+            db.execute('INSERT INTO outbox(topic,qos,payload) VALUES (?,?,?)',
+                       ('scans', 1, json.dumps(dict(event_id='legacy', content='old'))))
+        publisher = self.publisher()
+        client = self.clients[-1]
+        client.online.set()
+        client.auto_ack = True
+        publisher.wake()
+        wait_until(lambda: publisher.pending_count == 0)
+        self.assertEqual(client.sent[0][2]['event_id'], 'legacy')
+
 
 if __name__ == "__main__":
     unittest.main()

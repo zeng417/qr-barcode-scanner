@@ -37,6 +37,7 @@ class DetectedCode:
     points: Optional[np.ndarray | list]  # 构造时接受列表，内部统一为 Nx2 int32 数组
     data: str
     rect: Optional[tuple] = None  # 条码的近似矩形 (x, y, w, h)
+    source: str = ""  # 跨引擎同位置的内容冲突按引擎优先级处理
 
     def __post_init__(self) -> None:
         if self.points is not None:
@@ -97,12 +98,16 @@ class CodeDetector:
 
     @staticmethod
     def _merge_results(codes: list[DetectedCode]) -> list[DetectedCode]:
-        """同内容且轴对齐外接框标准 IoU >= 0.7 时合并跨引擎重复结果。"""
+        """以外接框标准 IoU >= 0.7 合并重复框；跨引擎同位置内容冲突时优先 ZXing。"""
         merged: list[DetectedCode] = []
-        for code in codes:
+        priority = {"zxing-cpp": 0, "pyzbar": 1, "OpenCV": 2}
+        for code in sorted(codes, key=lambda item: priority.get(item.source, 3)):
             duplicate = False
             for existing in merged:
-                if (code.kind, code.data) != (existing.kind, existing.data):
+                if code.kind != existing.kind:
+                    continue
+                if code.data != existing.data and not (
+                        code.source and existing.source and code.source != existing.source):
                     continue
                 if code.points is None or existing.points is None:
                     # 缺少位置时无法判断是否为同一实体，保留结果供事件层关联。
@@ -129,7 +134,7 @@ class CodeDetector:
                 if ok and points is not None:
                     results = [self._make_qr(text, pts / scale)
                                for text, pts in zip(texts, points) if text]
-            except cv2.error:
+            except (cv2.error, UnicodeError):
                 pass
         if not results:
             try:
@@ -137,9 +142,17 @@ class CodeDetector:
                 if data:
                     results.append(self._make_qr(
                         data, None if points is None else points / scale))
-            except cv2.error:
+            except (cv2.error, UnicodeError):
                 pass
         return results
+
+    @staticmethod
+    def _payload_text(raw: bytes) -> str:
+        """UTF-8 文本直接保留；其他字节用可逆的十六进制表示，不替换或丢弃。"""
+        try:
+            return raw.decode("utf-8")
+        except UnicodeError:
+            return "hex:" + raw.hex()
 
     def _decode_zxing(self, image: np.ndarray, scale: float = 1.0) -> list[DetectedCode]:
         """用 zxing-cpp 解码二维码/一维条码，结果坐标换算回原图。"""
@@ -152,7 +165,11 @@ class CodeDetector:
 
         out: list[DetectedCode] = []
         for result in found:
-            if not result.valid or not result.text:
+            if not result.valid:
+                continue
+            raw = getattr(result, "bytes", None)
+            data = self._payload_text(bytes(raw)) if raw is not None else result.text
+            if not data:
                 continue
             pos = result.position
             points = np.array(
@@ -169,7 +186,8 @@ class CodeDetector:
                 DetectedCode(
                     kind=kind,
                     points=(points / scale).astype(int),
-                    data=result.text,
+                    data=data,
+                    source="zxing-cpp",
                 )
             )
         return out
@@ -185,7 +203,7 @@ class CodeDetector:
 
         out: list[DetectedCode] = []
         for obj in found:
-            data = obj.data.decode("utf-8", errors="replace")
+            data = self._payload_text(obj.data)
             if not data:
                 continue
             if obj.type == "QRCODE" and obj.polygon:
@@ -193,7 +211,8 @@ class CodeDetector:
                     [[p.x, p.y] for p in obj.polygon], dtype=np.float32
                 )
                 out.append(
-                    DetectedCode(kind="QR", points=(points / scale).astype(int), data=data)
+                    DetectedCode(kind="QR", points=(points / scale).astype(int), data=data,
+                                 source="pyzbar")
                 )
                 continue
 
@@ -208,6 +227,7 @@ class CodeDetector:
                     kind=kind,
                     points=(points / scale).astype(int),
                     data=data,
+                    source="pyzbar",
                     rect=(
                         int(x / scale),
                         int(y / scale),
@@ -222,7 +242,7 @@ class CodeDetector:
     def _make_qr(data: str, points: Optional[np.ndarray]) -> DetectedCode:
         """构造二维码结果。"""
         pts = None if points is None else points.reshape(-1, 2).astype(int)
-        return DetectedCode(kind="QR", points=pts, data=data)
+        return DetectedCode(kind="QR", points=pts, data=data, source="OpenCV")
 
     def _decode_qr_curved(self, image: np.ndarray) -> tuple[str, Optional[np.ndarray]]:
         """处理曲面/透视畸变的二维码（部分 OpenCV 版本不支持则跳过）。"""
@@ -230,7 +250,7 @@ class CodeDetector:
             return "", None
         try:
             data, points, _ = self._qr.detectAndDecodeCurved(image)
-        except cv2.error:
+        except (cv2.error, UnicodeError):
             return "", None
         return data, points
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import queue
 import threading
 import time
@@ -31,12 +32,13 @@ class DetectionWorker:
         self._pending: tuple[float, np.ndarray] | None = None
         self._results: queue.Queue[ScanResult] = queue.Queue(maxsize=1)
         self._stop = threading.Event()
+        self._finishing = False
         self._thread = threading.Thread(target=self._run, name="code-detector", daemon=True)
         self._thread.start()
 
     def submit(self, frame: np.ndarray, captured_at: float | None = None) -> None:
         with self._condition:
-            if self._stop.is_set():
+            if self._stop.is_set() or self._finishing:
                 return
             if self._empty and self._skip > 0:
                 self._skip -= 1
@@ -56,8 +58,9 @@ class DetectionWorker:
     def _run(self) -> None:
         while not self._stop.is_set():
             with self._condition:
-                self._condition.wait_for(lambda: self._pending is not None or self._stop.is_set())
-                if self._stop.is_set():
+                self._condition.wait_for(lambda: self._pending is not None or self._stop.is_set()
+                                         or self._finishing)
+                if self._stop.is_set() or self._finishing:
                     return
                 captured_at, frame = self._pending
                 self._pending = None
@@ -77,13 +80,29 @@ class DetectionWorker:
             if result.error is not None:
                 return
 
-    def close(self) -> None:
-        self._stop.set()
+    def close(self, timeout: float = 1.0) -> list[ScanResult]:
+        """停止接收帧，收集已完成和正在识别的结果；超时才放弃仍未完成的解码。"""
         with self._condition:
+            self._finishing = True
             self._pending = None
             self._condition.notify_all()
-        # 本地原生解码无法中断；不让异常缓慢的解码阻塞关闭窗口。
-        self._thread.join(timeout=1.0)
+        completed = []
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            result = self.poll()
+            if result is not None:
+                completed.append(result)
+                continue
+            if not self._thread.is_alive() or time.monotonic() >= deadline:
+                break
+            self._thread.join(timeout=min(0.01, max(0.0, deadline - time.monotonic())))
+        self._stop.set()
+        if self._thread.is_alive():
+            logging.getLogger(__name__).warning("后台解码超过关闭时限，仍未完成的帧已放弃")
+        # 线程退出和最后一次 poll 之间仍可能交付结果。
+        while (result := self.poll()) is not None:
+            completed.append(result)
+        return completed
 
 
 @dataclass

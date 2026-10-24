@@ -1,4 +1,4 @@
-"""MQTT 发布器：本地有界待发队列，确认后删除，重连或重启后继续发送。"""
+"""MQTT 后台发送：共享事件库、确认唤醒、超时重连和失败事件隔离。"""
 
 from __future__ import annotations
 
@@ -6,12 +6,14 @@ import datetime
 import json
 import logging
 import os
-import queue
 from pathlib import Path
+import queue
 import sqlite3
 import threading
 import time
 import uuid
+
+from .storage import ensure_schema, promote_pending
 
 try:
     import paho.mqtt.client as mqtt
@@ -22,111 +24,121 @@ logger = logging.getLogger(__name__)
 
 
 class MqttPublisher:
-    """publish 返回入队是否成功；送达由后台确认，采用至少一次语义。"""
-
-    def __init__(
-        self,
-        broker: str,
-        port: int,
-        topic: str,
-        client_id: str = "",
-        username: str = "",
-        password: str = "",
-        qos: int = 1,
-        outbox_path: str = "records/mqtt_outbox.sqlite3",
-        max_pending: int = 1000,
-        close_timeout: float = 3.0,
-    ) -> None:
-        if qos not in (0, 1, 2) or max_pending < 1 or close_timeout < 0:
-            raise ValueError("Invalid MQTT qos, queue size or close timeout")
-        self.broker = broker
-        self.port = port
-        self.topic = topic
-        self.qos = qos
-        self._client = None
-        self._db = None
+    def __init__(self, broker, port, topic, client_id='', username='', password='', qos=1,
+                 outbox_path='records/mqtt_outbox.sqlite3', max_pending=1000,
+                 close_timeout=3.0, ack_timeout=10.0, max_attempts=3):
+        if qos not in (0, 1, 2) or max_pending < 1 or close_timeout < 0 or ack_timeout <= 0 or max_attempts < 1:
+            raise ValueError('Invalid MQTT queue, QoS or timeout configuration')
+        if not topic or '+' in topic or '#' in topic or '\0' in topic:
+            raise ValueError('Invalid MQTT publish topic')
+        self.broker, self.port, self.topic, self.qos = broker, port, topic, qos
+        self._client_id = client_id or f'qr-barcode-{os.getpid()}'
+        self._username, self._password = username, password
+        self._client = self._db = None
         self._condition = threading.Condition()
-        self._max_pending = max_pending
-        self._close_timeout = close_timeout
-        self._closing = False
-        self._closed = False
-        self._deadline = float("inf")
-        self._inflight = None
-        self._inflight_id = None
-        self._inflight_confirmed = False
+        self._wake = threading.Event()
+        self._max_pending, self._close_timeout = max_pending, close_timeout
+        self._ack_timeout, self._max_attempts = ack_timeout, max_attempts
+        self._closing = self._closed = False
+        self._deadline = float('inf')
+        self._inflight = self._inflight_row = None
+        self._confirmed = False
+        self._sent_at = self._retry_at = 0.0
         self._acks = queue.SimpleQueue()
         if mqtt is None:
             return
-
-        client_id = client_id or f"qr-barcode-{os.getpid()}"
-        if hasattr(mqtt, "CallbackAPIVersion"):
-            self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
-        else:
-            self._client = mqtt.Client(client_id=client_id)
-        if username:
-            self._client.username_pw_set(username, password)
-        self._client.on_publish = self._on_publish
-        self._client.reconnect_delay_set(min_delay=1, max_delay=30)
-        self._client.max_queued_messages_set(1)
         Path(outbox_path).parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(outbox_path, check_same_thread=False, timeout=0.5)
-        self._db.execute("""CREATE TABLE IF NOT EXISTS outbox (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            topic TEXT NOT NULL, qos INTEGER NOT NULL, payload TEXT NOT NULL)""")
-        self._db.commit()
+        self._db = sqlite3.connect(outbox_path, check_same_thread=False, timeout=0.2)
         try:
-            self._client.connect_async(broker, port)
-            self._client.loop_start()
+            ensure_schema(self._db)
+            self._start_client()
         except Exception:
             self._db.close()
             raise
-        self._thread = threading.Thread(target=self._run, name="mqtt-outbox", daemon=True)
+        self._thread = threading.Thread(target=self._run, name='mqtt-outbox', daemon=True)
         self._thread.start()
 
+    def _start_client(self):
+        if hasattr(mqtt, 'CallbackAPIVersion'):
+            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=self._client_id)
+        else:
+            client = mqtt.Client(client_id=self._client_id)
+        if self._username:
+            client.username_pw_set(self._username, self._password)
+        client.on_publish = self._on_publish
+        client.on_connect = lambda *args: self.wake()
+        client.on_disconnect = lambda *args: self.wake()
+        client.reconnect_delay_set(min_delay=1, max_delay=30)
+        client.max_queued_messages_set(1)
+        self._client = client
+        try:
+            client.connect_async(self.broker, self.port)
+            client.loop_start()
+        except Exception:
+            self._client = None
+            client.loop_stop()
+            raise
+
+    def wake(self):
+        self._wake.set()
+
     @property
-    def available(self) -> bool:
+    def available(self):
         return self._client is not None
 
     @property
-    def connected(self) -> bool:
+    def connected(self):
         return self._client is not None and self._client.is_connected()
 
     @property
-    def pending_count(self) -> int:
+    def pending_count(self):
         with self._condition:
             if self._db is None or self._closed:
                 return 0
-            return self._db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+            return self._db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0]
 
-    def publish(self, kind: str, content: str) -> bool:
-        """持久化后返回 True，即使尚未连接；队列满或写入失败时明确报错。"""
-        payload = json.dumps({
-            "event_id": uuid.uuid4().hex,
-            "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
-            "type": kind,
-            "content": content,
-        }, ensure_ascii=False)
+    def publish(self, kind, content):
+        """供独立调用者入队；主程序由 EventRecorder 原子写入事件和待发项。"""
+        event = {'event_id': uuid.uuid4().hex,
+                 'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
+                 'type': kind, 'content': content}
         with self._condition:
             if self._db is None or self._closing or self._closed:
                 return False
             try:
                 if self.pending_count >= self._max_pending:
-                    logger.error("MQTT 待发队列已满（%s 条），新事件未入队", self._max_pending)
+                    logger.error('MQTT 待发队列已满，新事件未入队')
                     return False
-                self._db.execute("INSERT INTO outbox(topic, qos, payload) VALUES (?, ?, ?)",
-                                 (self.topic, self.qos, payload))
-                self._db.commit()
+                with self._db:
+                    self._db.execute('INSERT INTO outbox(topic,qos,payload) VALUES (?,?,?)',
+                                     (self.topic, self.qos, json.dumps(event, ensure_ascii=False)))
             except sqlite3.Error:
-                self._db.rollback()
-                logger.exception("MQTT 事件写入本地待发队列失败")
+                logger.exception('MQTT 入队失败')
                 return False
-            self._condition.notify_all()
+            self.wake()
             return True
 
-    def _send_pending(self) -> None:
-        """在条件锁内调用；同一时间只提交一条，避免重连时重复塞入 paho 队列。"""
+    def _complete(self, row, error=None):
+        row_id, topic, qos, payload, attempts = row
+        event_id = json.loads(payload).get('event_id')
+        with self._db:
+            if error:
+                self._db.execute('INSERT INTO mqtt_failures(topic,qos,payload,attempts,reason) '
+                                 'VALUES (?,?,?,?,?)', (topic, qos, payload, attempts, error))
+            self._db.execute('UPDATE events SET state=? WHERE event_id=?',
+                             ('failed' if error else 'sent', event_id))
+            self._db.execute('DELETE FROM outbox WHERE id=?', (row_id,))
+        if error:
+            logger.error('MQTT 事件 %s 已保存在 mqtt_failures：%s', event_id, error)
+
+    def _clear_inflight(self):
+        self._inflight = self._inflight_row = None
+        self._confirmed = False
+
+    def _send_pending(self):
+        now = time.monotonic()
         if self._inflight is not None:
-            while not self._inflight_confirmed:
+            while not self._confirmed:
                 try:
                     mid, success = self._acks.get_nowait()
                 except queue.Empty:
@@ -134,73 +146,110 @@ class MqttPublisher:
                 if mid != self._inflight.mid:
                     continue
                 if success:
-                    self._inflight_confirmed = True
+                    self._confirmed = True
                 else:
-                    logger.warning("MQTT Broker 拒绝消息，保留本地事件以便重试")
-                    self._inflight = None
-                    self._inflight_id = None
-                break
-            if self._inflight_confirmed:
-                # 若本地删除/提交临时失败，下一轮继续完成删除，不丢失已收到的 ACK。
-                try:
-                    self._db.execute("DELETE FROM outbox WHERE id = ?", (self._inflight_id,))
-                    self._db.commit()
-                except sqlite3.Error:
-                    self._db.rollback()
-                    raise
-                self._inflight = None
-                self._inflight_id = None
-                self._inflight_confirmed = False
-            self._condition.notify_all()
-            return
-        if not self.connected:
-            return
-        row = self._db.execute("SELECT id, topic, qos, payload FROM outbox ORDER BY id LIMIT 1").fetchone()
+                    if self._inflight_row[4] >= self._max_attempts:
+                        self._complete(self._inflight_row, 'Broker rejected message')
+                    else:
+                        logger.warning('MQTT Broker 拒绝消息，将有限重试')
+                    self._clear_inflight()
+                    self._retry_at = now + 0.1
+                    return 'progress'
+            if self._confirmed:
+                self._complete(self._inflight_row)
+                self._clear_inflight()
+                return 'progress'
+            if self.connected and now - self._sent_at >= self._ack_timeout:
+                if self._inflight_row[4] >= self._max_attempts:
+                    self._complete(self._inflight_row, 'Acknowledgement timed out')
+                else:
+                    logger.warning('MQTT 确认超时，将重连后重试同一事件')
+                self._clear_inflight()
+                return 'restart'
+            return None
+        if not self.connected or now < self._retry_at:
+            return None
+        with self._db:
+            promote_pending(self._db, self._max_pending)
+        row = self._db.execute('SELECT id,topic,qos,payload,attempts FROM outbox ORDER BY id LIMIT 1').fetchone()
         if row is None:
-            return
-        row_id, topic, qos, payload = row
-        info = self._client.publish(topic, payload, qos=qos)
-        # QoS 1/2 在发送前断连时，paho 已经将消息放入内部队列，会自行重发。
-        accepted = info.rc == mqtt.MQTT_ERR_SUCCESS or (
-            qos > 0 and info.rc == mqtt.MQTT_ERR_NO_CONN)
-        if accepted:
-            self._inflight, self._inflight_id = info, row_id
-        else:
-            logger.warning("MQTT 发布失败（rc=%s），保留本地事件以便重试", info.rc)
+            return None
+        if row[4] >= self._max_attempts:
+            self._complete(row, 'Retry budget exhausted before restart')
+            return 'progress'
+        try:
+            info = self._client.publish(row[1], row[3], qos=row[2])
+        except (ValueError, TypeError) as exc:
+            self._complete(row, str(exc))
+            return 'progress'
+        if info.rc == mqtt.MQTT_ERR_SUCCESS or (row[2] > 0 and info.rc == mqtt.MQTT_ERR_NO_CONN):
+            with self._db:
+                self._db.execute('UPDATE outbox SET attempts=attempts+1 WHERE id=?', (row[0],))
+            self._inflight = info
+            self._inflight_row = (*row[:4], row[4] + 1)
+            self._sent_at = now
+            return 'progress'
+        self._retry_at = now + 0.2
+        logger.warning('MQTT 发布失败 rc=%s，事件保留在本地', info.rc)
+        return None
 
-    def _on_publish(self, client, userdata, mid, *args) -> None:
-        # 同时兼容 paho 1.x/2.x；不在网络回调里获取数据库锁。
-        success = not (args and getattr(args[0], "is_failure", False))
-        self._acks.put((mid, success))
+    def _on_publish(self, client, userdata, mid, *args):
+        if client is self._client:
+            self._acks.put((mid, not (args and getattr(args[0], 'is_failure', False))))
+            self.wake()
 
-    def _run(self) -> None:
-        with self._condition:
-            while True:
-                if self._closing and (time.monotonic() >= self._deadline or self.pending_count == 0):
-                    return
-                try:
-                    self._send_pending()
-                except Exception:
-                    # 保留磁盘记录；错误可见，短暂网络/存储故障后继续尝试。
-                    logger.exception("MQTT 后台发送失败，事件仍保留在本地")
-                self._condition.wait(timeout=0.1)
+    def _restart_client(self):
+        old = self._client
+        self._client = None
+        try:
+            old.disconnect()
+        finally:
+            old.loop_stop()
+        while not self._acks.empty():
+            self._acks.get_nowait()
+        self._start_client()
 
-    def close(self) -> None:
-        if self._client is None or self._closed:
+    def _run(self):
+        while True:
+            self._wake.clear()
+            try:
+                if self._client is None and not self._closing:
+                    self._start_client()
+                with self._condition:
+                    if self._closing and (time.monotonic() >= self._deadline or (
+                            self.pending_count == 0 and not self._db.execute(
+                                "SELECT 1 FROM events WHERE state='deferred' LIMIT 1").fetchone())):
+                        return
+                    action = self._send_pending()
+                if action == 'restart':
+                    self._restart_client()
+                if action:
+                    continue
+            except Exception:
+                logger.exception('MQTT 后台发送失败，事件仍保留在本地')
+            # 回调和新事件立即唤醒；超时仅用于检查连接及确认期限。
+            wait = min(0.2, self._ack_timeout)
+            if self._closing:
+                wait = min(wait, max(0, self._deadline - time.monotonic()))
+            self._wake.wait(wait)
+
+    def close(self):
+        if self._db is None or self._closed:
             return
         with self._condition:
             self._closing = True
             self._deadline = time.monotonic() + self._close_timeout
-            self._condition.notify_all()
-        # 保持网络循环运行，给待发消息和 PUBACK 一个有限的完成时间。
+            self.wake()
         self._thread.join()
-        remaining = self.pending_count
-        if remaining:
-            logger.warning("MQTT 仍有 %s 条事件未确认，已保留在本地，下次启动继续发送", remaining)
         try:
-            self._client.disconnect()
+            if self.pending_count or self._db.execute(
+                    "SELECT 1 FROM events WHERE state='deferred' LIMIT 1").fetchone():
+                logger.warning('MQTT 待确认事件保留在本地，下次启动继续发送')
+            if self._client is not None:
+                self._client.disconnect()
         finally:
-            self._client.loop_stop()
+            if self._client is not None:
+                self._client.loop_stop()
             with self._condition:
                 self._db.close()
                 self._closed = True

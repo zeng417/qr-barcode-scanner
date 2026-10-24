@@ -78,6 +78,36 @@ class DetectorTests(unittest.TestCase):
         self.detector._qr.detectAndDecode.return_value = ("single", code("x").points, None)
         self.assertEqual(self.detector._decode_opencv(self.image)[0].data, "single")
 
+    def test_opencv_encoding_errors_are_isolated(self):
+        self.detector._qr = Mock()
+        error = UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid byte')
+        self.detector._qr.detectAndDecodeMulti.side_effect = error
+        self.detector._qr.detectAndDecode.side_effect = error
+        self.detector._qr.detectAndDecodeCurved.side_effect = error
+        self.assertEqual(self.detector._decode_opencv(self.image), [])
+        self.assertEqual(self.detector._decode_qr_curved(self.image), ('', None))
+
+    def test_binary_payload_uses_lossless_hex_representation(self):
+        self.assertEqual(self.detector._payload_text(b'\xff\xfeABC'), 'hex:fffe414243')
+        self.assertEqual(self.detector._payload_text('中文'.encode()), '中文')
+
+    @unittest.skipUnless(module._HAS_ZXING and hasattr(module.zxingcpp, 'create_barcode'),
+                         'Requires zxing-cpp image writer')
+    def test_real_non_utf8_qr_does_not_crash(self):
+        barcode = module.zxingcpp.create_barcode(b'\xff\xfeABC', module.zxingcpp.BarcodeFormat.QRCode)
+        image = np.asarray(module.zxingcpp.write_barcode_to_image(barcode, scale=8))
+        found = self.detector.detect(image)
+        self.assertIn('hex:fffe414243', [c.data for c in found])
+        self.assertEqual(len(found), 1)
+
+    def test_conflicting_engine_encodings_at_same_position_use_primary_decoder(self):
+        primary = code('hex:fffe414243')
+        primary.source = 'zxing-cpp'
+        secondary = code('ÿþABC')
+        secondary.source = 'pyzbar'
+        found = self.detector._merge_results([secondary, primary])
+        self.assertEqual([c.data for c in found], ['hex:fffe414243'])
+
     def test_enhancement_keeps_all_codes_and_merges_across_variants(self):
         self.detector._decode_zxing = Mock(side_effect=[[code("A"), code("B", 40)], [code("A")]])
         self.detector._decode_zbar = Mock(return_value=[code("C", 80, "BARCODE")])

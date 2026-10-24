@@ -1,7 +1,7 @@
 # 二维码 & 条形码实时识别器
 
 基于 OpenCV 的摄像头实时扫码工具：自动识别 **QR 二维码** 与 **一维条形码**，
-在画面绘制包围框显示解码内容，识别历史自动保存到本地 CSV。
+在画面绘制包围框显示解码内容，扫描事件持久化到 SQLite，并自动导出本地 CSV。
 
 ## 功能
 
@@ -9,7 +9,9 @@
 - 二维码与一维条码识别，合并 zxing-cpp、pyzbar 与 OpenCV 的结果，按内容和位置消除重复框
 - 在画面绘制多边形包围框并展示解码文本
 - 识别失败时自动放大画面并锐化/二值化后重试，提升小码、模糊、远距离场景的识别率
-- 识别成功打印结果并写入 CSV 持久化存储
+- 识别成功打印结果；后台保存事件、导出 CSV，存储临时失败时缓存并重试
+- 非 UTF-8 内容显示为可逆的 `hex:...` 字节表示，不因 OpenCV 编码异常退出
+- 同一位置不同引擎给出不同文本时，按 zxing-cpp、pyzbar、OpenCV 的顺序选择结果，避免编码差异导致重复上报
 - 后台线程识别，待处理帧只保留最新一帧，增强识别按时间和次数限频
 - 可选：识别结果通过 MQTT 推送到 Broker，便于接入 IoT / 机器人
 - 可选：识别到 `http(s)` 链接自动打开浏览器
@@ -45,6 +47,8 @@ python -m qr_barcode.main
 - 按“类型 + 内容 + 相邻检测中的位置”关联实例。默认一次完整检测结果中未发现该实例就视为离开，再出现立即上报，不再等待 2 秒。后台跳帧或尚未返回检测结果不算离开。
 - 此规则无法区分实际离开与识别漏检，因此漏检后重现也会重新上报；需要容忍漏检时可增加 `SCAN_MAX_MISSED_DETECTIONS`。同内容码快速移动、交叉或缺少坐标时，实例关联存在歧义，不能作为严格的物品计数保证。
 - 按 `Q` 或 `Esc` 退出；按 `S` 保存当前画面到 `records/`，用于排查识别失败
+- 关闭时先收集已完成与正在处理的识别结果（默认等待最多 1 秒），再排空事件存储缓冲和 MQTT；尚未开始识别的待处理帧会放弃，超时未完成的解码会输出提示
+- 摄像头连续读取失败默认重试到 3 次后以非零状态退出；截图检查实际写入结果，使用唯一文件名避免覆盖
 
 ## 配置
 
@@ -54,6 +58,7 @@ python -m qr_barcode.main
 | --- | --- | --- |
 | `CAMERA_INDEX` | 摄像头设备号 | `0` |
 | `CAMERA_WIDTH` / `CAMERA_HEIGHT` | 摄像头采集分辨率 | `1280` / `720` |
+| `CAMERA_READ_FAILURE_LIMIT` / `CAMERA_RETRY_DELAY` | 连续读取失败上限与重试间隔 | `3` / `0.1` 秒 |
 | `DETECT_EVERY_N_FRAMES` | 最近识别结果为空时，每 N 个采集帧提交一帧到后台；待处理帧仅保留最新一帧 | `1` |
 | `ENHANCE_EVERY_N_DETECTIONS` / `ENHANCE_INTERVAL_SECONDS` | 无码时增强识别的最小次数与时间间隔（两者均需满足） | `5` / `0.5` 秒 |
 | `SCAN_MAX_MISSED_DETECTIONS` | 允许实例连续缺失的完整检测次数；默认缺失一次就结束跟踪 | `0` |
@@ -61,13 +66,17 @@ python -m qr_barcode.main
 | `RESULT_MAX_AGE_SECONDS` | 识别框超过此时间不再绘制，避免旧框长时间残留 | `1.0` 秒 |
 | `AUTO_OPEN_URL` | 识别到链接时自动打开浏览器 | `True` |
 | `RECORD_CSV` | 历史记录文件路径 | `records/history.csv` |
+| `EVENT_DATABASE_PATH` | 扫描事件和 MQTT 队列共用的 SQLite；保留原队列文件名便于迁移 | `records/mqtt_outbox.sqlite3` |
+| `STORAGE_MAX_BUFFER` / `STORAGE_CLOSE_TIMEOUT` | 存储故障时的内存缓冲上限与退出排空等待预算 | `1000` / `3.0` 秒 |
+| `DETECTION_CLOSE_TIMEOUT` | 退出时等待正在处理的识别完成的时间 | `1.0` 秒 |
 | `MQTT_ENABLED` | 是否启用 MQTT 推送 | `False` |
 | `MQTT_BROKER` / `MQTT_PORT` | MQTT Broker 地址与端口 | `127.0.0.1` / `1883` |
 | `MQTT_TOPIC` | 识别结果发布主题 | `qr_barcode/scans` |
 | `MQTT_USERNAME` / `MQTT_PASSWORD` | Broker 认证信息，留空表示匿名 | 空 |
-| `MQTT_OUTBOX_PATH` | 本地待发队列，重启后恢复发送 | `records/mqtt_outbox.sqlite3` |
-| `MQTT_MAX_PENDING` | 待发队列上限，达到上限时明确报错，原有事件保留 | `1000` |
+| `MQTT_OUTBOX_PATH` | 旧路径配置，作为 `EVENT_DATABASE_PATH` 的默认值；主程序实际使用后者 | `records/mqtt_outbox.sqlite3` |
+| `MQTT_MAX_PENDING` | 活跃待发队列上限，主程序超出部分留在事件库中延后入队 | `1000` |
 | `MQTT_CLOSE_TIMEOUT` | 退出时排空队列的等待预算，不包含网络线程清理时间 | `3.0` 秒 |
+| `MQTT_ACK_TIMEOUT` / `MQTT_MAX_ATTEMPTS` | 已连接状态下等待确认的超时与发送次数上限 | `10.0` 秒 / `3` |
 
 ## 项目结构
 
@@ -76,7 +85,8 @@ qr_barcode/
   config.py      # 配置项
   detector.py    # QR + 一维条码检测
   scanning.py    # 后台识别、最新帧调度与事件去重
-  recorder.py    # CSV 持久化记录
+  storage.py     # 事件与待发项原子提交、后台重试、CSV 导出
+  recorder.py    # 旧 CSV 工具接口（主程序使用 storage.py）
   publisher.py   # MQTT 结果推送
   main.py        # 摄像头实时主程序
 records/         # 运行时生成的识别历史
@@ -99,10 +109,19 @@ mosquitto_sub -h 127.0.0.1 -t qr_barcode/scans
 ```
 
 Broker 断开时自动重连，断线期间的事件保留在 SQLite 待发队列中，恢复连接后按顺序补发，不需要重新扫码。
-默认 QoS 1，收到确认后才删除本地事件；退出时最多等待 `MQTT_CLOSE_TIMEOUT` 秒，仍未确认的事件留到下次启用 MQTT 时继续发送。
+默认 QoS 1，收到确认后才删除本地待发项；退出时最多等待 `MQTT_CLOSE_TIMEOUT` 秒，仍未确认的事件留到下次启用 MQTT 时继续发送。
 采用至少一次发送语义，重启时可能重发已经送达但尚未删除的消息，接收端可按 `event_id` 去重。QoS 0 只能确认客户端发送，不能确认 Broker 收到，重要事件应使用 QoS 1 或 2。
-队列满或写入失败会输出错误，该次识别仍保存在 CSV 中，需要人工处理。一个待发队列文件供一个运行中的扫码进程使用。
-未安装 `paho-mqtt` 时程序会提示并自动关闭推送。
+确认回调立即唤醒发送线程；已连接但确认超时时重建连接，使用相同 `event_id` 重试。达到发送次数上限的事件保存在 `mqtt_failures` 表中并输出错误，后续事件继续发送；这些失败事件需人工检查和处理。
+事件与 MQTT 待发项在同一 SQLite 事务中提交。活跃队列满时，新扫描仍保存在 `events` 表中，等队列腾出空间再自动入队。一个事件库供一个运行中的扫码进程使用。
+未安装 `paho-mqtt` 或 MQTT 初始化失败时，采集继续，启用 MQTT 的扫描事件仍入库等待下次正常启动发送。
+
+## 存储与恢复
+
+SQLite 中的 `events` 表是扫描历史的来源；MQTT 确认后只移除待发项，历史事件继续保留。CSV 最多每秒导出一次，采用临时文件加原子替换，退出时再次导出。已有三列 CSV 首次使用时导入一次，不会把旧历史重新推送；旧版 MQTT 待发队列原地升级并保留原事件。
+
+CSV 写入失败不会阻止新事件入库；下次启动可从数据库重建 CSV。旧 CSV 无法读取或格式错误时保留原文件，新事件仍能入库，修复旧文件后再导出。
+
+数据库临时写入失败时，新事件暂存在有界内存缓冲中，恢复后重试。缓冲满、关闭时仍有未提交事件或 CSV 导出失败都会明确报错并以状态 `2` 退出。持续磁盘故障期间尚未入库的内存事件无法保证在进程退出或断电后恢复。
 
 ## 测试
 
@@ -110,4 +129,4 @@ Broker 断开时自动重连，断线期间的事件保留在 SQLite 待发队�
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖多引擎合并、多码增强识别、OpenCV 降级、去重、后台帧调度、MQTT 断线/重启补发与确认；不需要摄像头或真实 Broker。
+测试覆盖多引擎合并、二进制二维码、实例关联、后台帧调度与关闭回收、原子事件提交、CSV 恢复、摄像头错误，以及 MQTT 断线/重启补发、确认超时与失败隔离；不需要摄像头或真实 Broker。

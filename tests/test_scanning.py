@@ -89,6 +89,25 @@ class DeduplicatorTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_close_drains_completed_and_in_progress_results_without_deadlock(self):
+        second = threading.Event()
+
+        def detect(frame):
+            if frame[0, 0] == 2:
+                second.set()
+            return [DetectedCode('QR', None, str(frame[0, 0]))]
+
+        worker = DetectionWorker(Mock(detect=detect))
+        worker.submit(np.array([[1]], dtype=np.uint8))
+        # Wait until result 1 occupies the output slot, without consuming it.
+        from test_publisher import wait_until
+        wait_until(lambda: worker._results.qsize() == 1)
+        worker.submit(np.array([[2]], dtype=np.uint8))
+        self.assertTrue(second.wait(2))
+        completed = worker.close()
+        self.assertEqual([result.codes[0].data for result in completed], ['1', '2'])
+        self.assertFalse(worker._thread.is_alive())
+
     def test_submission_does_not_wait_for_decode_and_pending_frame_is_latest_copy(self):
         entered, release = threading.Event(), threading.Event()
         seen = []
