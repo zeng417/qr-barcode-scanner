@@ -25,19 +25,28 @@ from .config import (
     CAMERA_WIDTH,
     CSV_HEADER,
     DETECT_EVERY_N_FRAMES,
+    ENHANCE_EVERY_N_DETECTIONS,
+    ENHANCE_INTERVAL_SECONDS,
     MQTT_BROKER,
     MQTT_CLIENT_ID,
     MQTT_ENABLED,
+    MQTT_CLOSE_TIMEOUT,
+    MQTT_MAX_PENDING,
+    MQTT_OUTBOX_PATH,
     MQTT_PASSWORD,
     MQTT_PORT,
     MQTT_QOS,
     MQTT_TOPIC,
     MQTT_USERNAME,
     RECORD_CSV,
+    RESULT_MAX_AGE_SECONDS,
+    SCAN_MAX_CENTER_DISTANCE,
+    SCAN_MAX_MISSED_DETECTIONS,
 )
 from .detector import CodeDetector, DetectedCode
 from .publisher import MqttPublisher
 from .recorder import CsvRecorder
+from .scanning import DetectionWorker, ScanDeduplicator
 
 BOX_COLORS = {
     "QR": (0, 255, 0),        # 绿色
@@ -119,6 +128,9 @@ def create_publisher() -> MqttPublisher | None:
         username=MQTT_USERNAME,
         password=MQTT_PASSWORD,
         qos=MQTT_QOS,
+        outbox_path=MQTT_OUTBOX_PATH,
+        max_pending=MQTT_MAX_PENDING,
+        close_timeout=MQTT_CLOSE_TIMEOUT,
     )
     if not publisher.available:
         print("[提示] MQTT 已启用但未安装 paho-mqtt，推送已关闭。"
@@ -129,7 +141,7 @@ def create_publisher() -> MqttPublisher | None:
 
 
 def main() -> int:
-    detector = CodeDetector()
+    detector = CodeDetector(ENHANCE_EVERY_N_DETECTIONS, ENHANCE_INTERVAL_SECONDS)
     recorder = CsvRecorder(RECORD_CSV, CSV_HEADER)
     publisher = create_publisher()
     opened_links: set[str] = set()
@@ -155,11 +167,13 @@ def main() -> int:
     print("按 Q / Esc 退出，按 S 保存当前画面用于排查。")
 
     codes: list[DetectedCode] = []
-    active: set[tuple[str, str]] = set()  # 当前画面中的码，用于去重
-    detect_cooldown = 0
+    deduplicator = ScanDeduplicator(SCAN_MAX_MISSED_DETECTIONS, SCAN_MAX_CENTER_DISTANCE)
+    result_at = float("-inf")
+    worker = None
     window_ready = False
 
     try:
+        worker = DetectionWorker(detector, DETECT_EVERY_N_FRAMES)
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -179,29 +193,24 @@ def main() -> int:
                 print(f"[信息] 窗口尺寸: {win_w}x{win_h}")
                 window_ready = True
 
-            # 无码时才按 DETECT_EVERY_N_FRAMES 间隔重试，避免空转消耗 CPU
-            if detect_cooldown > 0:
-                detect_cooldown -= 1
-            else:
-                codes = detector.detect(frame)
-                if not codes and DETECT_EVERY_N_FRAMES > 1:
-                    detect_cooldown = DETECT_EVERY_N_FRAMES - 1
-
-                current = {(code.kind, code.data) for code in codes}
-                for code in codes:
-                    # 同一码持续出现在画面中时只记录一次
-                    if (code.kind, code.data) in active:
-                        continue
+            captured_at = time.monotonic()
+            result = worker.poll()
+            if result is not None:
+                if result.error is not None:
+                    raise RuntimeError("后台识别失败") from result.error
+                codes, result_at = result.codes, result.captured_at
+                for code in deduplicator.update(codes):
                     print(f"[{code.kind}] {code.data}")
                     recorder.add(code.kind, code.data)
-                    if publisher is not None:
-                        publisher.publish(code.kind, code.data)
+                    if publisher is not None and not publisher.publish(code.kind, code.data):
+                        print("[错误] MQTT 事件未能入队，识别结果已保存在 CSV，请检查待发队列。")
                     if code.data not in opened_links and maybe_open_url(code.data):
                         opened_links.add(code.data)
-                active = current
+            worker.submit(frame, captured_at)
 
-            for code in codes:
-                draw_code(frame, code)
+            if captured_at - result_at <= RESULT_MAX_AGE_SECONDS:
+                for code in codes:
+                    draw_code(frame, code)
 
             cv2.imshow(WINDOW_NAME, frame)
             key = cv2.waitKey(1) & 0xFF
@@ -214,10 +223,12 @@ def main() -> int:
             if key in (ord("q"), 27):  # q 或 Esc
                 break
     finally:
-        if publisher is not None:
-            publisher.close()
+        if worker is not None:
+            worker.close()
         cap.release()
         cv2.destroyAllWindows()
+        if publisher is not None:
+            publisher.close()
 
     print(f"[完成] 识别历史已保存至 {RECORD_CSV}")
     return 0
