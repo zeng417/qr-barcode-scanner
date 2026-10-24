@@ -2,13 +2,14 @@
 
 每个检测结果是一个 DetectedCode 对象：
 - kind: "QR" 或 "BARCODE"
-- points: 多边形包围框顶点（numpy 数组或列表）
+- points: 多边形包围框顶点（接受 numpy 数组或列表，构造后统一为 int32 数组）
 - data: 解码出的文本
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Optional
 
 import cv2
@@ -33,22 +34,30 @@ except Exception:  # pragma: no cover - 环境无关
 @dataclass
 class DetectedCode:
     kind: str  # "QR" | "BARCODE"
-    points: Optional[np.ndarray]  # Nx2 的四边形顶点坐标
+    points: Optional[np.ndarray | list]  # 构造时接受列表，内部统一为 Nx2 int32 数组
     data: str
     rect: Optional[tuple] = None  # 条码的近似矩形 (x, y, w, h)
+
+    def __post_init__(self) -> None:
+        if self.points is not None:
+            self.points = np.asarray(self.points, dtype=np.int32).reshape(-1, 2)
+            if len(self.points) < 3:
+                raise ValueError("points must contain at least three polygon vertices")
 
 
 class CodeDetector:
     """多引擎组合的二维码/条码检测器。
 
-    识别顺序：zxing-cpp -> pyzbar -> OpenCV，均失败后再做放大/二值化兜底。
+    合并各引擎结果，均失败后限频执行放大/二值化兜底。
     """
 
-    def __init__(self, retry_every: int = 5) -> None:
+    def __init__(self, retry_every: int = 5, retry_interval: float = 0.5) -> None:
         self._qr = cv2.QRCodeDetector()
-        # 没识别到码时，每隔 retry_every 帧才跑一次较重的兜底，避免拖慢实时画面
+        # 连续无码达到 retry_every 次检测且满足时间间隔后，才执行增强识别
         self._retry_every = max(1, retry_every)
         self._failed_frames = 0
+        self._retry_interval = max(0.0, retry_interval)
+        self._last_retry = float("-inf")
 
     @property
     def barcode_supported(self) -> bool:
@@ -69,19 +78,67 @@ class CodeDetector:
         """对单帧图像执行识别，返回命中的码列表。"""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
 
-        # zxing-cpp 对实拍码（透视、模糊、屏幕摩尔纹、反色）识别率最高且耗时最低
         results = self._decode_zxing(gray)
-        if not results and _HAS_PYZBAR:
-            results = self._decode_zbar(gray)
-        if any(code.kind == "QR" for code in results):
+        results.extend(self._decode_zbar(gray))
+        results.extend(self._decode_opencv(gray))
+        if results:
             self._failed_frames = 0
-            return results
+            return self._merge_results(results)
 
-        # 未识别到二维码时才执行较重的兜底策略
+        # 仅在完全无码时增强；帧数和时间双重限频。
         self._failed_frames += 1
-        if self._failed_frames >= self._retry_every:
+        now = time.monotonic()
+        if (self._failed_frames >= self._retry_every
+                and now - self._last_retry >= self._retry_interval):
             self._failed_frames = 0
+            self._last_retry = now
             results.extend(self._detect_qr_fallback(gray))
+        return self._merge_results(results)
+
+    @staticmethod
+    def _merge_results(codes: list[DetectedCode]) -> list[DetectedCode]:
+        """同内容且轴对齐外接框标准 IoU >= 0.7 时合并跨引擎重复结果。"""
+        merged: list[DetectedCode] = []
+        for code in codes:
+            duplicate = False
+            for existing in merged:
+                if (code.kind, code.data) != (existing.kind, existing.data):
+                    continue
+                if code.points is None or existing.points is None:
+                    # 缺少位置时无法判断是否为同一实体，保留结果供事件层关联。
+                    continue
+                lo = np.maximum(code.points.min(axis=0), existing.points.min(axis=0))
+                hi = np.minimum(code.points.max(axis=0), existing.points.max(axis=0))
+                intersection = float(np.prod(np.maximum(hi - lo, 0)))
+                area = float(np.prod(np.ptp(code.points, axis=0)))
+                existing_area = float(np.prod(np.ptp(existing.points, axis=0)))
+                union = area + existing_area - intersection
+                if union > 0 and intersection / union >= 0.7:
+                    duplicate = True
+                    break
+            if not duplicate:
+                merged.append(code)
+        return merged
+
+    def _decode_opencv(self, image: np.ndarray, scale: float = 1.0) -> list[DetectedCode]:
+        """常规 OpenCV 解码始终参与，优先支持同帧多个二维码。"""
+        results = []
+        if hasattr(self._qr, "detectAndDecodeMulti"):
+            try:
+                ok, texts, points, _ = self._qr.detectAndDecodeMulti(image)
+                if ok and points is not None:
+                    results = [self._make_qr(text, pts / scale)
+                               for text, pts in zip(texts, points) if text]
+            except cv2.error:
+                pass
+        if not results:
+            try:
+                data, points, _ = self._qr.detectAndDecode(image)
+                if data:
+                    results.append(self._make_qr(
+                        data, None if points is None else points / scale))
+            except cv2.error:
+                pass
         return results
 
     def _decode_zxing(self, image: np.ndarray, scale: float = 1.0) -> list[DetectedCode]:
@@ -184,32 +241,14 @@ class CodeDetector:
         _, otsu = cv2.threshold(big, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         variants = (sharp, otsu)
 
-        # zxing-cpp 最强，逐一变体尝试
+        found = []
         for variant in variants:
-            found = [
-                code for code in self._decode_zxing(variant, 2.0) if code.kind == "QR"
-            ]
-            if found:
-                return found[:1]
-
-        # zxing 未命中时再让 zbar 补一次（不同引擎对不同模糊码各有优势）
-        found = [
-            code for code in self._decode_zbar(sharp, 2.0) if code.kind == "QR"
-        ]
-        if found:
-            return found[:1]
-
-        # zxing/pyzbar 均不可用时，用 OpenCV 常规解码作为降级方案
-        if not _HAS_ZXING and not _HAS_PYZBAR:
-            try:
-                data, points, _ = self._qr.detectAndDecode(gray)
-            except cv2.error:
-                data, points = "", None
-            if data:
-                return [self._make_qr(data, points)]
+            found.extend(self._decode_zxing(variant, 2.0))
+            found.extend(self._decode_zbar(variant, 2.0))
+            found.extend(self._decode_opencv(variant, 2.0))
 
         # 曲面/畸变码
         data, points = self._decode_qr_curved(gray)
         if data:
-            return [self._make_qr(data, points)]
-        return []
+            found.append(self._make_qr(data, points))
+        return self._merge_results(found)
