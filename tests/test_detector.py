@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import cv2
@@ -87,6 +88,36 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(self.detector._decode_opencv(self.image), [])
         self.assertEqual(self.detector._decode_qr_curved(self.image), ('', None))
 
+    def test_opencv_removes_padding_before_rescaling_multi_and_single_results(self):
+        self.detector._qr = Mock()
+        original = np.array([code("A").points, code("B", 60).points])
+        transformed = original * 2 + (32, 24)
+        self.detector._qr.detectAndDecodeMulti.return_value = (
+            True, ("A", "B"), transformed, ())
+        found = self.detector._decode_opencv(self.image, 2.0, (32, 24))
+        self.assertEqual([c.data for c in found], ["A", "B"])
+        for result, expected in zip(found, original):
+            np.testing.assert_array_equal(result.points, expected)
+
+        self.detector._qr.detectAndDecodeMulti.return_value = (False, (), None, ())
+        self.detector._qr.detectAndDecode.return_value = ("A", transformed[0], None)
+        found = self.detector._decode_opencv(self.image, 2.0, (32, 24))
+        np.testing.assert_array_equal(found[0].points, original[0])
+
+    def test_real_qr_without_quiet_zone_works_with_only_opencv(self):
+        image = cv2.imread(str(Path(__file__).parent / "fixtures" / "qr_no_quiet_zone.png"))
+        self.assertIsNotNone(image)
+        with patch.object(module, "_HAS_ZXING", False), patch.object(module, "_HAS_PYZBAR", False):
+            found = self.detector.detect(image)
+        self.assertEqual([c.data for c in found],
+                         ["https://v.xiumius.cn/board/v5/7M0Za/724797659"])
+        self.assertEqual(found[0].source, "OpenCV")
+        # 白边必须扣除，否则框会整体偏移到图像以外。
+        self.assertTrue(np.all(found[0].points >= 0))
+        self.assertTrue(np.all(found[0].points < (image.shape[1], image.shape[0])))
+        self.assertTrue(np.all(found[0].points.min(axis=0) <= 3))
+        self.assertTrue(np.all(found[0].points.max(axis=0) >= 156))
+
     def test_binary_payload_uses_lossless_hex_representation(self):
         self.assertEqual(self.detector._payload_text(b'\xff\xfeABC'), 'hex:fffe414243')
         self.assertEqual(self.detector._payload_text('中文'.encode()), '中文')
@@ -111,9 +142,11 @@ class DetectorTests(unittest.TestCase):
     def test_enhancement_keeps_all_codes_and_merges_across_variants(self):
         self.detector._decode_zxing = Mock(side_effect=[[code("A"), code("B", 40)], [code("A")]])
         self.detector._decode_zbar = Mock(return_value=[code("C", 80, "BARCODE")])
-        self.detector._decode_opencv = Mock(return_value=[code("D", 120)])
+        self.detector._decode_opencv = Mock(side_effect=[
+            [code("E", 160)], [code("D", 120)], [code("D", 120)]])
         self.detector._decode_qr_curved = Mock(return_value=("", None))
-        self.assertEqual([c.data for c in self.detector._detect_qr_fallback(self.image)], ["A", "B", "C", "D"])
+        self.assertEqual([c.data for c in self.detector._detect_qr_fallback(self.image)],
+                         ["E", "A", "B", "C", "D"])
 
     def test_barcode_success_does_not_trigger_expensive_enhancement(self):
         self.detector._decode_zxing = Mock(return_value=[code("B", kind="BARCODE")])

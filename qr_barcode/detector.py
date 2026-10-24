@@ -49,7 +49,7 @@ class DetectedCode:
 class CodeDetector:
     """多引擎组合的二维码/条码检测器。
 
-    合并各引擎结果，均失败后限频执行放大/二值化兜底。
+    合并各引擎结果，均失败后限频执行补白边、放大/二值化兜底。
     """
 
     def __init__(self, retry_every: int = 5, retry_interval: float = 0.5) -> None:
@@ -125,14 +125,15 @@ class CodeDetector:
                 merged.append(code)
         return merged
 
-    def _decode_opencv(self, image: np.ndarray, scale: float = 1.0) -> list[DetectedCode]:
-        """常规 OpenCV 解码始终参与，优先支持同帧多个二维码。"""
+    def _decode_opencv(self, image: np.ndarray, scale: float = 1.0,
+                       offset: tuple[int, int] = (0, 0)) -> list[DetectedCode]:
+        """支持多码；先扣除输入图上的补边偏移，再按缩放比例还原坐标。"""
         results = []
         if hasattr(self._qr, "detectAndDecodeMulti"):
             try:
                 ok, texts, points, _ = self._qr.detectAndDecodeMulti(image)
                 if ok and points is not None:
-                    results = [self._make_qr(text, pts / scale)
+                    results = [self._make_qr(text, (pts - offset) / scale)
                                for text, pts in zip(texts, points) if text]
             except (cv2.error, UnicodeError):
                 pass
@@ -141,7 +142,7 @@ class CodeDetector:
                 data, points, _ = self._qr.detectAndDecode(image)
                 if data:
                     results.append(self._make_qr(
-                        data, None if points is None else points / scale))
+                        data, None if points is None else (points - offset) / scale))
             except (cv2.error, UnicodeError):
                 pass
         return results
@@ -255,13 +256,19 @@ class CodeDetector:
         return data, points
 
     def _detect_qr_fallback(self, gray: np.ndarray) -> list[DetectedCode]:
-        """放大 + 锐化 / 二值化后再次解码，适合画面中较小、较模糊的码。"""
+        """补足裁边图的静区，并合并放大、锐化 / 二值化后的结果。"""
+        # 紧贴图像边缘的二维码可能被 OpenCV 错定位。补白边恢复静区；
+        # 放在限频兜底中，避免每个无码摄像头帧都额外调用解码器。
+        border = max(16, round(min(gray.shape[:2]) * 0.2))
+        padded = cv2.copyMakeBorder(gray, border, border, border, border,
+                                    cv2.BORDER_CONSTANT, value=255)
+        found = self._decode_opencv(padded, offset=(border, border))
+
         big = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
         sharp = cv2.addWeighted(big, 2.0, cv2.GaussianBlur(big, (0, 0), 2), -1.0, 0)
         _, otsu = cv2.threshold(big, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         variants = (sharp, otsu)
 
-        found = []
         for variant in variants:
             found.extend(self._decode_zxing(variant, 2.0))
             found.extend(self._decode_zbar(variant, 2.0))
