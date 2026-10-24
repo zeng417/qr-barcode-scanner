@@ -118,6 +118,39 @@ class DetectorTests(unittest.TestCase):
         self.assertTrue(np.all(found[0].points.min(axis=0) <= 3))
         self.assertTrue(np.all(found[0].points.max(axis=0) >= 156))
 
+    @unittest.skipUnless(module._HAS_ZXING or module._HAS_PYZBAR, "Requires a screen QR decoder")
+    def test_real_camera_screen_qrs_are_found_without_waiting_for_enhancement(self):
+        for name in ("qr_screen_tilted.png", "qr_screen_small.png", "qr_screen_dark.png"):
+            with self.subTest(image=name):
+                gray = cv2.imread(str(Path(__file__).parent / "fixtures" / name), 0)
+                self.assertIsNotNone(gray)
+                detector = CodeDetector()
+                # 直接测试区域提取，不能因为某个版本的原图解码成功而绕过回归。
+                regions = detector._decode_qr_regions(gray)
+                self.assertEqual([c.data for c in regions],
+                                 ["https://v.xiumius.cn/board/v5/7M0Za/724797659"])
+                points = regions[0].points
+                self.assertTrue(np.all(points >= 0))
+                self.assertTrue(np.all(points < (gray.shape[1], gray.shape[0])))
+                # 区域坐标应还原成截图里的大框，不能停留在校正图的小框里。
+                self.assertGreater(np.ptp(points[:, 0]), gray.shape[1] * 0.7)
+                self.assertGreater(np.ptp(points[:, 1]), gray.shape[0] * 0.7)
+                detector._detect_qr_fallback = Mock(return_value=[])
+                self.assertEqual([c.data for c in detector.detect(gray)], [regions[0].data])
+                detector._detect_qr_fallback.assert_not_called()
+
+    def test_region_results_are_transformed_and_merged(self):
+        transform = np.array([[2, 0, 100], [0, 3, 50], [0, 0, 1]], dtype=float)
+        self.detector._decode_zxing = Mock(side_effect=lambda image: [code("A")])
+        self.detector._decode_zbar = Mock(return_value=[])
+        self.detector._decode_opencv = Mock(return_value=[])
+        with patch.object(module, "iter_qr_regions", return_value=iter([
+                (self.image, transform), (self.image, transform)])):
+            found = self.detector._decode_qr_regions(self.image)
+        self.assertEqual(len(found), 1)
+        np.testing.assert_array_equal(found[0].points,
+                                      [[100, 50], [140, 50], [140, 110], [100, 110]])
+
     def test_binary_payload_uses_lossless_hex_representation(self):
         self.assertEqual(self.detector._payload_text(b'\xff\xfeABC'), 'hex:fffe414243')
         self.assertEqual(self.detector._payload_text('中文'.encode()), '中文')

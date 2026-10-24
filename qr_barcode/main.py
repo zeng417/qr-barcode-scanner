@@ -245,10 +245,11 @@ def main() -> int:
                     if result.error is not None:
                         break
                 worker.submit(frame, captured_at)
+                display = frame.copy()
                 if captured_at - result_at <= RESULT_MAX_AGE_SECONDS:
                     for code in codes:
-                        draw_code(frame, code)
-                cv2.imshow(WINDOW_NAME, frame)
+                        draw_code(display, code)
+                cv2.imshow(WINDOW_NAME, display)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('s'):
                     if not save_snapshot(frame, os.path.dirname(RECORD_CSV) or '.'):

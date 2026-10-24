@@ -15,6 +15,8 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from .qr_regions import iter_qr_regions
+
 # 解码库均为可选依赖，缺少时自动降级
 try:
     import zxingcpp
@@ -82,6 +84,8 @@ class CodeDetector:
         results = self._decode_zxing(gray)
         results.extend(self._decode_zbar(gray))
         results.extend(self._decode_opencv(gray))
+        if not results:
+            results.extend(self._decode_qr_regions(gray))
         if results:
             self._failed_frames = 0
             return self._merge_results(results)
@@ -95,6 +99,22 @@ class CodeDetector:
             self._last_retry = now
             results.extend(self._detect_qr_fallback(gray))
         return self._merge_results(results)
+
+    def _decode_qr_regions(self, gray: np.ndarray) -> list[DetectedCode]:
+        """原图失败时提取深色背景上的码，再将区域中的识别框映射回原图。"""
+        found = []
+        for region, to_scene in iter_qr_regions(gray):
+            results = self._decode_zxing(region)
+            results.extend(self._decode_zbar(region))
+            results.extend(self._decode_opencv(region))
+            for code in results:
+                if code.points is not None:
+                    code.points = np.rint(cv2.perspectiveTransform(
+                        code.points.astype(np.float32)[None], to_scene)[0]).astype(np.int32)
+                # 区域内的轴对齐矩形经过透视映射后不再是原图上的矩形。
+                code.rect = None
+            found.extend(results)
+        return self._merge_results(found)
 
     @staticmethod
     def _merge_results(codes: list[DetectedCode]) -> list[DetectedCode]:

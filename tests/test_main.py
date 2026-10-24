@@ -9,7 +9,7 @@ from qr_barcode.scanning import ScanResult
 
 class MainLoopTests(unittest.TestCase):
     def run_main(self, results, publisher=None, completed=(), reads=None, keys=None,
-                 recorder_ok=True, add_ok=True):
+                 recorder_ok=True, add_ok=True, draw_effect=None):
         frame = np.zeros((40, 40, 3), dtype=np.uint8)
         capture = Mock()
         capture.isOpened.return_value = True
@@ -30,7 +30,7 @@ class MainLoopTests(unittest.TestCase):
                 'DetectionWorker': Mock(return_value=worker),
                 'create_publisher': Mock(return_value=publisher),
                 'window_size': Mock(return_value=(40, 40)),
-                'maybe_open_url': Mock(return_value=False), 'draw_code': Mock(),
+                'maybe_open_url': Mock(return_value=False), 'draw_code': Mock(side_effect=draw_effect),
             }.items():
                 stack.enter_context(patch.object(module, name, replacement))
             stack.enter_context(patch.object(module.cv2, 'VideoCapture', return_value=capture))
@@ -96,6 +96,15 @@ class MainLoopTests(unittest.TestCase):
             self.assertTrue(module.save_snapshot(None, '/tmp'))
             self.assertTrue(module.save_snapshot(None, '/tmp'))
             self.assertNotEqual(write.call_args_list[0].args[0], write.call_args_list[1].args[0])
+
+    def test_snapshot_saves_raw_camera_pixels_without_detection_overlay(self):
+        result = ScanResult(10, [DetectedCode('QR', None, 'A')])
+        with patch.object(module.time, 'monotonic', return_value=10), \
+                patch.object(module, 'save_snapshot', return_value=True) as save:
+            self.run_main([result, None], keys=[ord('s'), ord('q')],
+                          draw_effect=lambda frame, code: frame.fill(255))
+        save.assert_called_once()
+        self.assertFalse(np.any(save.call_args.args[0]))
 
 
 if __name__ == '__main__':
